@@ -8,3 +8,5 @@ pub mod session;
 pub mod source;
 pub mod verify;
 pub mod job;
+pub mod windows_host;
+pub mod app;
