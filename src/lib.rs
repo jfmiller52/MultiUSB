@@ -1,3 +1,4 @@
+pub mod commands;
 pub mod disk_id;
 pub mod copy;
 pub mod label;
