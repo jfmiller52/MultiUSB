@@ -1,3 +1,4 @@
+use crate::long_path::extended_path;
 use crate::source::{EntryKind, SourceEntry};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -31,6 +32,7 @@ pub fn verify_tree(dest: &Path, entries: &[SourceEntry]) -> VerifyReport {
             report.missing.push(entry.relative.clone());
             continue;
         };
+        let resolved = extended_path(&resolved);
         let Ok(meta) = fs::symlink_metadata(&resolved) else {
             report.missing.push(entry.relative.clone());
             continue;
@@ -52,19 +54,19 @@ pub fn verify_tree(dest: &Path, entries: &[SourceEntry]) -> VerifyReport {
 }
 
 fn resolve_case_insensitive(base: &Path, relative: &Path) -> Option<PathBuf> {
-    let mut current = base.to_path_buf();
+    let mut current = extended_path(base);
     for component in relative.components() {
         match component {
             Component::Normal(name) => {
                 let name = name.to_string_lossy();
                 let mut next = None;
-                let Ok(entries) = fs::read_dir(&current) else {
+                let Ok(entries) = fs::read_dir(extended_path(&current)) else {
                     return None;
                 };
                 for entry in entries.flatten() {
                     let entry_name = entry.file_name().to_string_lossy().to_string();
                     if entry_name.eq_ignore_ascii_case(name.as_ref()) {
-                        next = Some(entry.path());
+                        next = Some(extended_path(&entry.path()));
                         break;
                     }
                 }
@@ -81,7 +83,11 @@ fn resolve_case_insensitive(base: &Path, relative: &Path) -> Option<PathBuf> {
 }
 
 pub fn mismatch_summary(report: &VerifyReport) -> String {
-    let mut paths: Vec<&PathBuf> = report.missing.iter().chain(report.size_mismatch.iter()).collect();
+    let mut paths: Vec<&PathBuf> = report
+        .missing
+        .iter()
+        .chain(report.size_mismatch.iter())
+        .collect();
     let total = paths.len();
     let mut lines = Vec::new();
     for path in paths.drain(..total.min(20)) {
@@ -104,17 +110,14 @@ pub fn mismatch_summary(report: &VerifyReport) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{mismatch_summary, verify_tree, VerifyReport};
-    use crate::source::{EntryKind, SourceEntry};
+    use super::{VerifyReport, mismatch_summary, verify_tree};
+    use crate::source::{EntryKind, SourceEntry, walk_source};
     use std::fs;
     use std::path::PathBuf;
 
     #[test]
     fn verify_is_case_insensitive() {
-        let base = std::env::temp_dir().join(format!(
-            "multiusb_verify_ci_{}",
-            std::process::id()
-        ));
+        let base = std::env::temp_dir().join(format!("multiusb_verify_ci_{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir(&base).unwrap();
         fs::write(base.join("File.TXT"), b"same").unwrap();
@@ -133,10 +136,7 @@ mod tests {
 
     #[test]
     fn verify_reports_missing_and_size() {
-        let base = std::env::temp_dir().join(format!(
-            "multiusb_verify_err_{}",
-            std::process::id()
-        ));
+        let base = std::env::temp_dir().join(format!("multiusb_verify_err_{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir(&base).unwrap();
         fs::write(base.join("short.bin"), b"ab").unwrap();
@@ -164,6 +164,53 @@ mod tests {
         assert!(!report.passed());
         assert_eq!(report.missing, vec![PathBuf::from("gone.txt")]);
         assert_eq!(report.size_mismatch, vec![PathBuf::from("short.bin")]);
+    }
+
+    #[test]
+    fn walk_and_verify_path_longer_than_max_path() {
+        let root = std::env::temp_dir().join(format!("multiusb_long_{}", std::process::id()));
+        let extended_root = PathBuf::from(format!(r"\\?\{}", root.display()));
+        let _ = fs::remove_dir_all(&extended_root);
+        fs::create_dir_all(&extended_root).unwrap();
+
+        let segment = "n".repeat(40);
+        let mut relative = PathBuf::new();
+        let mut full = root.clone();
+        let file_relative = loop {
+            relative.push(&segment);
+            full.push(&segment);
+            let extended_dir = PathBuf::from(format!(r"\\?\{}", full.display()));
+            fs::create_dir_all(&extended_dir).unwrap();
+            if full.to_string_lossy().len() > 260 {
+                let file_full = full.join("payload.bin");
+                assert!(file_full.to_string_lossy().len() > 260);
+                let extended_file = PathBuf::from(format!(r"\\?\{}", file_full.display()));
+                fs::write(&extended_file, b"long").unwrap();
+                break relative.join("payload.bin");
+            }
+        };
+
+        let walk = walk_source(&extended_root).expect("walk a path longer than MAX_PATH");
+        let report = verify_tree(&extended_root, &walk.entries);
+        let plain = walk_source(&root).expect("walk the same tree from its ordinary path");
+        let plain_report = verify_tree(&root, &plain.entries);
+        let _ = fs::remove_dir_all(&extended_root);
+
+        let file = walk
+            .entries
+            .iter()
+            .find(|entry| entry.relative == file_relative)
+            .expect("long file is in the walk");
+        assert_eq!(file.kind, EntryKind::File);
+        assert_eq!(file.size, 4);
+        assert!(report.passed(), "{report:?}");
+        assert!(plain_report.passed(), "{plain_report:?}");
+        assert!(
+            plain
+                .entries
+                .iter()
+                .any(|entry| entry.relative == file_relative)
+        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::long_path::extended_path;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -25,20 +26,22 @@ pub fn walk_source(root: &Path) -> std::io::Result<Walk> {
         entries: Vec::new(),
         skipped_links: Vec::new(),
     };
-    walk_directory(root, root, &mut walk)?;
+    let root = extended_path(root);
+    walk_directory(&root, &root, &mut walk)?;
     walk.entries.sort_by(|a, b| a.relative.cmp(&b.relative));
     walk.skipped_links.sort_by(|a, b| a.cmp(b));
     Ok(walk)
 }
 
 fn walk_directory(root: &Path, dir: &Path, walk: &mut Walk) -> std::io::Result<()> {
-    for entry in fs::read_dir(dir)? {
+    let dir = extended_path(dir);
+    for entry in fs::read_dir(&dir)? {
         let entry = entry?;
-        let path = entry.path();
+        let path = extended_path(&entry.path());
         let relative = path
             .strip_prefix(root)
             .map(Path::to_path_buf)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
 
         let file_type = fs::symlink_metadata(&path)?.file_type();
         if file_type.is_symlink() {
@@ -67,7 +70,7 @@ fn walk_directory(root: &Path, dir: &Path, walk: &mut Walk) -> std::io::Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::{walk_source, EntryKind, SourceEntry};
+    use super::{EntryKind, SourceEntry, walk_source};
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
@@ -77,15 +80,14 @@ mod tests {
     }
 
     fn has_entry(entries: &[SourceEntry], relative: &str, kind: EntryKind) -> bool {
-        entries.iter().any(|e| e.relative == PathBuf::from(relative) && e.kind == kind)
+        entries
+            .iter()
+            .any(|e| e.relative == PathBuf::from(relative) && e.kind == kind)
     }
 
     #[test]
     fn walk_includes_empty_dir_nested_file_and_hidden_file() {
-        let base = std::env::temp_dir().join(format!(
-            "multiusb_walk_{}",
-            std::process::id()
-        ));
+        let base = std::env::temp_dir().join(format!("multiusb_walk_{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("empty")).unwrap();
         fs::create_dir_all(base.join("nested")).unwrap();
@@ -115,10 +117,7 @@ mod tests {
 
     #[test]
     fn walk_does_not_follow_junction() {
-        let base = std::env::temp_dir().join(format!(
-            "multiusb_junction_{}",
-            std::process::id()
-        ));
+        let base = std::env::temp_dir().join(format!("multiusb_junction_{}", std::process::id()));
         let target = base.join("target");
         let link = base.join("link");
         let _ = fs::remove_dir_all(&base);
@@ -135,18 +134,25 @@ mod tests {
             ])
             .status()
             .unwrap();
-        assert!(status.success(), "mklink /J failed — run as user with symlink privilege");
+        assert!(
+            status.success(),
+            "mklink /J failed — run as user with symlink privilege"
+        );
 
         let walk = walk_source(&base).unwrap();
         let _ = fs::remove_dir_all(&base);
 
         let paths = rel_paths(&walk.entries);
         assert!(
-            !paths.iter().any(|p| p == &PathBuf::from(r"link\secret.txt")),
+            !paths
+                .iter()
+                .any(|p| p == &PathBuf::from(r"link\secret.txt")),
             "junction contents must not be walked"
         );
         assert!(
-            walk.skipped_links.iter().any(|p| p == &PathBuf::from("link")),
+            walk.skipped_links
+                .iter()
+                .any(|p| p == &PathBuf::from("link")),
             "junction relative path must be in skipped_links"
         );
     }

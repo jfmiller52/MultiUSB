@@ -35,9 +35,35 @@ pub struct Prepared {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanedDisk {
+    pub number: u32,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrepareAll {
-    AbortSystemDisk { number: u32, model: String },
+    AbortSystemDisk {
+        number: u32,
+        model: String,
+        cleaned: Vec<CleanedDisk>,
+    },
     Done(Vec<Result<Prepared, PrepareFailure>>),
+}
+
+pub fn system_disk_stop_message(number: u32, model: &str, cleaned: &[CleanedDisk]) -> String {
+    let system = format!("Disk {number} ({model}) contains the Windows system volume.");
+    if cleaned.is_empty() {
+        return format!("Stopped before any wipe. {system}");
+    }
+    let mut lines = Vec::with_capacity(cleaned.len() + 1);
+    for disk in cleaned {
+        lines.push(format!(
+            "Disk {} ({}) was already cleaned.",
+            disk.number, disk.model
+        ));
+    }
+    lines.push(system);
+    lines.join(" ")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,8 +73,14 @@ pub enum PrepareNotice {
 }
 
 enum DiskStep {
-    Abort { number: u32, model: String },
-    Finished(Result<Prepared, PrepareFailure>),
+    Abort {
+        number: u32,
+        model: String,
+    },
+    Finished {
+        result: Result<Prepared, PrepareFailure>,
+        cleaned: Option<CleanedDisk>,
+    },
 }
 
 pub fn prepare_all(
@@ -71,18 +103,33 @@ pub fn prepare_all(
         }
     };
     if let Gate::AbortSystemDisk { number, model } = gate(selected, &current) {
-        return PrepareAll::AbortSystemDisk { number, model };
+        return PrepareAll::AbortSystemDisk {
+            number,
+            model,
+            cleaned: Vec::new(),
+        };
     }
 
     let total = selected.len();
     let mut prepared = Vec::with_capacity(total);
+    let mut cleaned = Vec::new();
     for (index, id) in selected.iter().enumerate() {
         on_prepare(PrepareNotice::Formatting { index, total });
         match prepare_disk(id, filesystem, style, label, host) {
             DiskStep::Abort { number, model } => {
-                return PrepareAll::AbortSystemDisk { number, model };
+                return PrepareAll::AbortSystemDisk {
+                    number,
+                    model,
+                    cleaned,
+                };
             }
-            DiskStep::Finished(result) => {
+            DiskStep::Finished {
+                result,
+                cleaned: just_cleaned,
+            } => {
+                if let Some(disk) = just_cleaned {
+                    cleaned.push(disk);
+                }
                 on_prepare(PrepareNotice::Finished { index });
                 prepared.push(result);
             }
@@ -100,14 +147,27 @@ fn prepare_disk(
 ) -> DiskStep {
     let current = match host.list_all() {
         Ok(disks) => disks,
-        Err(message) => return DiskStep::Finished(Err(PrepareFailure::Command(message))),
+        Err(message) => {
+            return DiskStep::Finished {
+                result: Err(PrepareFailure::Command(message)),
+                cleaned: None,
+            };
+        }
     };
     let number = match rematch(id, &current) {
         Rematch::Unique(number) => number,
-        other => return DiskStep::Finished(Err(PrepareFailure::Rematch(other))),
+        other => {
+            return DiskStep::Finished {
+                result: Err(PrepareFailure::Rematch(other)),
+                cleaned: None,
+            };
+        }
     };
     let Some(disk) = current.into_iter().find(|disk| disk.number == number) else {
-        return DiskStep::Finished(Err(PrepareFailure::Rematch(Rematch::Missing)));
+        return DiskStep::Finished {
+            result: Err(PrepareFailure::Rematch(Rematch::Missing)),
+            cleaned: None,
+        };
     };
     if disk.contains_system_volume {
         return DiskStep::Abort {
@@ -115,24 +175,28 @@ fn prepare_disk(
             model: disk.model,
         };
     }
-    match prepare_plan(disk.number, style, filesystem, label, disk.size_bytes) {
-        PreparePlan::Fat32TooLarge => DiskStep::Finished(Err(PrepareFailure::Fat32TooLarge)),
-        PreparePlan::Script(script) => DiskStep::Finished(finish_script(host, &disk, &script)),
-        PreparePlan::LargeFat32 { script } => {
-            DiskStep::Finished(finish_large_fat32(host, &disk, &script, label))
-        }
-    }
+    let (result, cleaned) =
+        match prepare_plan(disk.number, style, filesystem, label, disk.size_bytes) {
+            PreparePlan::Fat32TooLarge => (Err(PrepareFailure::Fat32TooLarge), None),
+            PreparePlan::Script(script) => finish_script(host, &disk, &script),
+            PreparePlan::LargeFat32 { script } => finish_large_fat32(host, &disk, &script, label),
+        };
+    DiskStep::Finished { result, cleaned }
 }
 
 fn finish_script(
     host: &mut dyn VolumeHost,
     disk: &EnumeratedDisk,
     script: &str,
-) -> Result<Prepared, PrepareFailure> {
-    host.diskpart(script)
-        .map_err(|_| PrepareFailure::Diskpart)?;
-    let letter = take_letter(host, &disk.id)?;
-    Ok(prepared_disk(disk, letter))
+) -> (Result<Prepared, PrepareFailure>, Option<CleanedDisk>) {
+    if host.diskpart(script).is_err() {
+        return (Err(PrepareFailure::Diskpart), None);
+    }
+    let cleaned = Some(cleaned_disk(disk));
+    match take_letter(host, &disk.id) {
+        Ok(letter) => (Ok(prepared_disk(disk, letter)), cleaned),
+        Err(failure) => (Err(failure), cleaned),
+    }
 }
 
 fn finish_large_fat32(
@@ -140,19 +204,33 @@ fn finish_large_fat32(
     disk: &EnumeratedDisk,
     script: &str,
     label: &str,
-) -> Result<Prepared, PrepareFailure> {
-    host.diskpart(script)
-        .map_err(|_| PrepareFailure::Diskpart)?;
-    let letter = take_letter(host, &disk.id)?;
+) -> (Result<Prepared, PrepareFailure>, Option<CleanedDisk>) {
+    if host.diskpart(script).is_err() {
+        return (Err(PrepareFailure::Diskpart), None);
+    }
+    let cleaned = Some(cleaned_disk(disk));
+    let letter = match take_letter(host, &disk.id) {
+        Ok(letter) => letter,
+        Err(failure) => return (Err(failure), cleaned),
+    };
     let exe = host.exe_path();
     if !fat32format_beside_exe(&exe).exists() {
-        return Err(PrepareFailure::MissingFat32Format);
+        return (Err(PrepareFailure::MissingFat32Format), cleaned);
     }
-    host.run_command(&fat32format_command(&exe, letter))
-        .map_err(PrepareFailure::Command)?;
-    host.run_command(&volume_label_command(letter, label))
-        .map_err(PrepareFailure::Command)?;
-    Ok(prepared_disk(disk, letter))
+    if let Err(message) = host.run_command(&fat32format_command(&exe, letter)) {
+        return (Err(PrepareFailure::Command(message)), cleaned);
+    }
+    if let Err(message) = host.run_command(&volume_label_command(letter, label)) {
+        return (Err(PrepareFailure::Command(message)), cleaned);
+    }
+    (Ok(prepared_disk(disk, letter)), cleaned)
+}
+
+fn cleaned_disk(disk: &EnumeratedDisk) -> CleanedDisk {
+    CleanedDisk {
+        number: disk.number,
+        model: disk.model.clone(),
+    }
 }
 
 fn take_letter(host: &mut dyn VolumeHost, id: &DiskId) -> Result<char, PrepareFailure> {
@@ -474,10 +552,20 @@ mod tests {
             &mut on_prepare,
         );
 
-        assert!(matches!(
-            result,
-            PrepareAll::AbortSystemDisk { number: 2, model } if model == "System USB"
-        ));
+        match result {
+            PrepareAll::AbortSystemDisk {
+                number: 2,
+                model,
+                cleaned,
+            } if model == "System USB" => {
+                assert!(cleaned.is_empty());
+                assert_eq!(
+                    system_disk_stop_message(2, &model, &cleaned),
+                    "Stopped before any wipe. Disk 2 (System USB) contains the Windows system volume."
+                );
+            }
+            other => panic!("expected the first inventory to abort, got {other:?}"),
+        }
         assert!(host.scripts.is_empty());
         assert!(marks(&host).is_empty());
     }
@@ -693,7 +781,8 @@ mod tests {
 
         assert!(matches!(
             result,
-            PrepareAll::AbortSystemDisk { number: 1, model } if model == "System USB"
+            PrepareAll::AbortSystemDisk { number: 1, model, cleaned }
+                if model == "System USB" && cleaned.is_empty()
         ));
         assert!(host.scripts.is_empty());
         assert_eq!(marks(&host), vec![Mark::Formatting { index: 0, total: 2 }]);
@@ -725,7 +814,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            PrepareAll::AbortSystemDisk { number: 2, model } if model == "System USB"
+            PrepareAll::AbortSystemDisk { number: 2, model, .. } if model == "System USB"
         ));
         assert_eq!(
             host.scripts,
@@ -743,6 +832,60 @@ mod tests {
                 Mark::Finished(0),
                 Mark::Formatting { index: 1, total: 2 },
             ]
+        );
+    }
+
+    #[test]
+    fn relist_system_disk_names_disks_whose_script_already_ran() {
+        let first = removable(1, "Safe", "USB\\A", 100);
+        let second = removable(2, "System USB", "USB\\B", 100);
+        let third = removable(3, "Later", "USB\\C", 100);
+        let selected = ids(&[first.clone(), second.clone(), third.clone()]);
+        let mut second_system = second.clone();
+        second_system.contains_system_volume = true;
+        let mut host = FakeHost::new(vec![
+            Ok(vec![first.clone(), second.clone(), third.clone()]),
+            Ok(vec![first, second, third.clone()]),
+            Ok(vec![
+                removable(1, "Safe", "USB\\A", 100),
+                second_system,
+                third,
+            ]),
+        ]);
+        host.letter("USB\\A", 'E');
+        let mut on_prepare = notices(&host);
+
+        let result = prepare_all(
+            &selected,
+            Filesystem::Ntfs,
+            PartitionStyle::Gpt,
+            "STORE",
+            &mut host,
+            &mut on_prepare,
+        );
+
+        match result {
+            PrepareAll::AbortSystemDisk {
+                number,
+                model,
+                cleaned,
+            } => {
+                assert_eq!(number, 2);
+                assert_eq!(model, "System USB");
+                assert_eq!(
+                    system_disk_stop_message(number, &model, &cleaned),
+                    "Disk 1 (Safe) was already cleaned. Disk 2 (System USB) contains the Windows system volume."
+                );
+            }
+            PrepareAll::Done(results) => panic!("expected abort, got {results:?}"),
+        }
+        assert_eq!(
+            host.scripts,
+            vec![diskpart_script(
+                1,
+                "gpt",
+                "format fs=ntfs quick label=\"STORE\""
+            )]
         );
     }
 

@@ -18,16 +18,7 @@ pub enum CopyError {
     File { path: PathBuf, attempts: u32 },
 }
 
-pub fn extended_path(path: &Path) -> PathBuf {
-    let s = path.to_string_lossy();
-    if s.starts_with(r"\\?\") {
-        return path.to_path_buf();
-    }
-    if s.starts_with(r"\\") {
-        return PathBuf::from(format!(r"\\?\UNC\{}", &s[2..]));
-    }
-    PathBuf::from(format!(r"\\?\{}", s))
-}
+pub use crate::long_path::extended_path;
 
 pub fn copy_tree(
     source_root: &Path,
@@ -77,12 +68,12 @@ pub fn copy_tree(
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_tree, extended_path, CopyError, RetryPolicy, COPY_RETRY};
-    use crate::source::{walk_source, EntryKind, SourceEntry};
+    use super::{COPY_RETRY, CopyError, RetryPolicy, copy_tree, extended_path};
+    use crate::source::{EntryKind, SourceEntry, walk_source};
+    use std::cell::Cell;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::cell::Cell;
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -112,15 +103,7 @@ mod tests {
         let dest = tmp("empty_dest");
         let _ = fs::remove_dir_all(&dest);
         fs::create_dir_all(&dest).unwrap();
-        let total = copy_tree(
-            Path::new("."),
-            &dest,
-            &[],
-            COPY_RETRY,
-            &|_| {},
-            &|_| {},
-        )
-        .unwrap();
+        let total = copy_tree(Path::new("."), &dest, &[], COPY_RETRY, &|_| {}, &|_| {}).unwrap();
         let _ = fs::remove_dir_all(&dest);
         assert_eq!(total, 0);
     }
@@ -136,18 +119,16 @@ mod tests {
         fs::write(src.join("nested").join("a.txt"), b"hello").unwrap();
         let walk = walk_source(&src).unwrap();
         let bytes_reported = Cell::new(0u64);
-        let total = copy_tree(
-            &src,
-            &dest,
-            &walk.entries,
-            COPY_RETRY,
-            &|_| {},
-            &|n| bytes_reported.set(bytes_reported.get() + n),
-        )
+        let total = copy_tree(&src, &dest, &walk.entries, COPY_RETRY, &|_| {}, &|n| {
+            bytes_reported.set(bytes_reported.get() + n)
+        })
         .unwrap();
         let _ = fs::remove_dir_all(&src);
         assert!(dest.join("empty").is_dir());
-        assert_eq!(fs::read(dest.join("nested").join("a.txt")).unwrap(), b"hello");
+        assert_eq!(
+            fs::read(dest.join("nested").join("a.txt")).unwrap(),
+            b"hello"
+        );
         assert_eq!(total, 5);
         assert_eq!(bytes_reported.get(), 5);
         let _ = fs::remove_dir_all(&dest);
@@ -164,15 +145,7 @@ mod tests {
         fs::write(src.join("only.txt"), b"x").unwrap();
         fs::write(dest.join("extra.txt"), b"stay").unwrap();
         let walk = walk_source(&src).unwrap();
-        copy_tree(
-            &src,
-            &dest,
-            &walk.entries,
-            COPY_RETRY,
-            &|_| {},
-            &|_| {},
-        )
-        .unwrap();
+        copy_tree(&src, &dest, &walk.entries, COPY_RETRY, &|_| {}, &|_| {}).unwrap();
         assert_eq!(fs::read(dest.join("extra.txt")).unwrap(), b"stay");
         let _ = fs::remove_dir_all(&src);
         let _ = fs::remove_dir_all(&dest);
@@ -189,15 +162,7 @@ mod tests {
         fs::write(src.join("data.bin"), b"newbytes").unwrap();
         fs::write(dest.join("data.bin"), b"old").unwrap();
         let walk = walk_source(&src).unwrap();
-        copy_tree(
-            &src,
-            &dest,
-            &walk.entries,
-            COPY_RETRY,
-            &|_| {},
-            &|_| {},
-        )
-        .unwrap();
+        copy_tree(&src, &dest, &walk.entries, COPY_RETRY, &|_| {}, &|_| {}).unwrap();
         assert_eq!(fs::read(dest.join("data.bin")).unwrap(), b"newbytes");
         let _ = fs::remove_dir_all(&src);
         let _ = fs::remove_dir_all(&dest);
@@ -218,15 +183,7 @@ mod tests {
             .unwrap();
         assert!(status.success());
         let walk = walk_source(&src).unwrap();
-        copy_tree(
-            &src,
-            &dest,
-            &walk.entries,
-            COPY_RETRY,
-            &|_| {},
-            &|_| {},
-        )
-        .unwrap();
+        copy_tree(&src, &dest, &walk.entries, COPY_RETRY, &|_| {}, &|_| {}).unwrap();
         assert_eq!(fs::read(dest.join("hidden.dat")).unwrap(), b"secret");
         let _ = fs::remove_dir_all(&src);
         let _ = fs::remove_dir_all(&dest);
@@ -269,13 +226,7 @@ mod tests {
             recorded,
             vec![Duration::from_secs(10), Duration::from_secs(10)]
         );
-        assert!(matches!(
-            err,
-            CopyError::File {
-                attempts: 3,
-                ..
-            }
-        ));
+        assert!(matches!(err, CopyError::File { attempts: 3, .. }));
     }
 
     #[test]

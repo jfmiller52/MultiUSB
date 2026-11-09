@@ -1,20 +1,20 @@
 use crate::disk_id::{DiskId, EnumeratedDisk};
 use crate::job::{
-    copy_and_verify_all, failure_text, prepare_all, CopyTarget, DriveOutcome, PrepareAll,
-    PrepareFailure, PrepareNotice, VolumeHost,
+    CleanedDisk, CopyTarget, DriveOutcome, PrepareAll, PrepareFailure, PrepareNotice, VolumeHost,
+    copy_and_verify_all, failure_text, prepare_all, system_disk_stop_message,
 };
 use crate::label::{Filesystem, PartitionStyle};
 use crate::log_file::write_run_log;
 use crate::session::{
-    confirmation_body, initial_form, overall_fraction, run_another_batch, start_enabled, BatchUi,
-    DriveRow,
+    BatchUi, DriveRow, confirmation_body, initial_form, overall_fraction, run_another_batch,
+    start_enabled,
 };
-use crate::source::{walk_source, EntryKind, SourceEntry};
-use crate::windows_host::{is_elevated, relaunch_elevated, CloseGate, WindowsHost};
+use crate::source::{EntryKind, SourceEntry, walk_source};
+use crate::windows_host::{CloseGate, WindowsHost, is_elevated, relaunch_elevated};
 use iced::widget::{
     button, checkbox, column, pick_list, progress_bar, row, scrollable, text, text_input,
 };
-use iced::{event, window, Element, Event, Fill, Subscription, Task};
+use iced::{Element, Event, Fill, Subscription, Task, event, window};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Once};
 
@@ -83,9 +83,17 @@ struct DriveRun {
 #[derive(Debug, Clone)]
 enum JobEvent {
     Prepare(PrepareNotice),
-    Aborted { number: u32, model: String },
+    Aborted {
+        number: u32,
+        model: String,
+        cleaned: Vec<CleanedDisk>,
+    },
     Prepared(Vec<Result<crate::job::Prepared, PrepareFailure>>),
-    Bytes { index: usize, copied: u64, total: u64 },
+    Bytes {
+        index: usize,
+        copied: u64,
+        total: u64,
+    },
     Finished(Vec<DriveOutcome>),
     Crashed,
 }
@@ -391,12 +399,8 @@ impl App {
         }
 
         if !self.ui.log.is_empty() {
-            let lines: Vec<Element<'_, Message>> = self
-                .ui
-                .log
-                .iter()
-                .map(|line| text(line).into())
-                .collect();
+            let lines: Vec<Element<'_, Message>> =
+                self.ui.log.iter().map(|line| text(line).into()).collect();
             children.push(
                 scrollable(column(lines).spacing(4))
                     .height(200)
@@ -413,15 +417,10 @@ impl App {
             );
         }
 
-        scrollable(
-            column(children)
-                .spacing(10)
-                .padding(16)
-                .width(Fill),
-        )
-        .width(Fill)
-        .height(Fill)
-        .into()
+        scrollable(column(children).spacing(10).padding(16).width(Fill))
+            .width(Fill)
+            .height(Fill)
+            .into()
     }
 
     fn reload_disks(&mut self) {
@@ -530,11 +529,13 @@ impl App {
                     run.fraction = 1.0;
                 }
             }
-            JobEvent::Aborted { number, model } => {
+            JobEvent::Aborted {
+                number,
+                model,
+                cleaned,
+            } => {
                 self.runs.clear();
-                self.publish_results(vec![format!(
-                    "Stopped before any wipe. Disk {number} ({model}) contains the Windows system volume."
-                )]);
+                self.publish_results(vec![system_disk_stop_message(number, &model, &cleaned)]);
             }
             JobEvent::Prepared(results) => {
                 let mut slot = 0usize;
@@ -607,26 +608,17 @@ impl App {
                         None => {}
                     }
                 }
-                let lines = result_lines(
-                    &self.runs,
-                    &self.disks,
-                    &outcomes,
-                    &self.skipped_links,
-                );
+                let lines = result_lines(&self.runs, &self.disks, &outcomes, &self.skipped_links);
                 self.publish_results(lines);
             }
             JobEvent::Crashed => {
-                self.publish_results(vec![
-                    "The batch stopped unexpectedly.".to_string(),
-                ]);
+                self.publish_results(vec!["The batch stopped unexpectedly.".to_string()]);
             }
         }
     }
 
     fn publish_results(&mut self, lines: Vec<String>) {
-        let stamp = chrono::Local::now()
-            .format("%Y-%m-%d_%H-%M-%S")
-            .to_string();
+        let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
         let mut shown = lines.clone();
         match std::env::current_dir() {
             Ok(dir) => {
@@ -651,11 +643,7 @@ impl App {
     }
 }
 
-fn on_window_event(
-    event: Event,
-    _status: event::Status,
-    _window: window::Id,
-) -> Option<Message> {
+fn on_window_event(event: Event, _status: event::Status, _window: window::Id) -> Option<Message> {
     match event {
         Event::Window(window::Event::CloseRequested) => Some(Message::CloseRequested),
         _ => None,
@@ -724,8 +712,19 @@ fn run_batch(
         )
     };
     match prepared {
-        PrepareAll::AbortSystemDisk { number, model } => {
-            send_event(tx, JobEvent::Aborted { number, model });
+        PrepareAll::AbortSystemDisk {
+            number,
+            model,
+            cleaned,
+        } => {
+            send_event(
+                tx,
+                JobEvent::Aborted {
+                    number,
+                    model,
+                    cleaned,
+                },
+            );
         }
         PrepareAll::Done(results) => {
             let targets: Vec<CopyTarget> = results
@@ -787,10 +786,7 @@ fn stop_copy_if_closed(gate: &CloseGate) {
     }
 }
 
-fn send_event(
-    tx: &Mutex<futures::channel::mpsc::UnboundedSender<JobEvent>>,
-    event: JobEvent,
-) {
+fn send_event(tx: &Mutex<futures::channel::mpsc::UnboundedSender<JobEvent>>, event: JobEvent) {
     let sender = tx.lock().unwrap_or_else(|err| err.into_inner());
     let _ = sender.unbounded_send(event);
 }
@@ -847,7 +843,10 @@ fn drive_row(disk: &EnumeratedDisk) -> DriveRow {
         key: disk_key(disk),
         checked: false,
         model: format!("Disk {} {} {}", disk.number, disk.model, size),
-        detail: format!("Disk {}  {}  {}  {}", disk.number, disk.model, size, letters),
+        detail: format!(
+            "Disk {}  {}  {}  {}",
+            disk.number, disk.model, size, letters
+        ),
     }
 }
 

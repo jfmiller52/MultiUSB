@@ -1,5 +1,5 @@
 use crate::commands::{
-    parse_all_disk_json, run_with_retries, ExternalCommand, DISKPART_ATTEMPTS, DISKPART_WAIT,
+    DISKPART_ATTEMPTS, DISKPART_WAIT, ExternalCommand, parse_all_disk_json, run_with_retries,
 };
 use crate::disk_id::{DiskId, EnumeratedDisk};
 use crate::job::VolumeHost;
@@ -60,11 +60,7 @@ impl VolumeHost for WindowsHost {
     }
 
     fn diskpart(&mut self, script: &str) -> Result<(), String> {
-        let _guard = self
-            .gate
-            .lock
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
+        let _guard = self.gate.lock.lock().unwrap_or_else(|err| err.into_inner());
         if self.gate.is_requested() {
             std::process::exit(0);
         }
@@ -149,9 +145,9 @@ pub fn is_elevated() -> bool {
 }
 
 pub fn relaunch_elevated(exe: &Path) -> std::io::Result<()> {
-    use windows::core::{w, HSTRING, PCWSTR};
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::{HSTRING, PCWSTR, w};
 
     let file = HSTRING::from(exe.as_os_str());
     let result = unsafe {
@@ -257,10 +253,7 @@ fn inventory_json() -> Result<String, String> {
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(format!(
-                "PowerShell inventory failed: {}",
-                stderr.trim()
-            ))
+            Err(format!("PowerShell inventory failed: {}", stderr.trim()))
         }
         Err(err) => Err(err.to_string()),
     };
@@ -291,9 +284,9 @@ try {
     foreach ($disk in $disks) {
         $letters = New-Object System.Collections.Generic.List[string]
         $contains = $false
-        $partitions = @(Get-CimAssociatedInstance -InputObject $disk -ResultClassName Win32_DiskPartition -ErrorAction SilentlyContinue)
+        $partitions = @(Get-CimAssociatedInstance -InputObject $disk -ResultClassName Win32_DiskPartition)
         foreach ($part in $partitions) {
-            $logicals = @(Get-CimAssociatedInstance -InputObject $part -ResultClassName Win32_LogicalDisk -ErrorAction SilentlyContinue)
+            $logicals = @(Get-CimAssociatedInstance -InputObject $part -ResultClassName Win32_LogicalDisk)
             foreach ($logical in $logicals) {
                 $device = [string]$logical.DeviceID
                 if ($device -eq $systemDrive) { $contains = $true }
@@ -341,3 +334,68 @@ try {
     exit 1
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::INVENTORY_SCRIPT;
+    use std::fs;
+    use std::process::Command;
+
+    #[test]
+    fn failed_association_query_fails_inventory() {
+        let stub = r#"
+function Get-CimInstance {
+    [CmdletBinding()]
+    param([string]$ClassName)
+    [pscustomobject]@{
+        MediaType = 'Removable Media'
+        Model = 'TestStick'
+        Index = [uint32]7
+        Size = [uint64]100
+        PNPDeviceID = 'USB\TEST'
+        SerialNumber = 'ABC'
+    }
+}
+function Get-CimAssociatedInstance {
+    [CmdletBinding()]
+    param($InputObject, [string]$ResultClassName)
+    Write-Error 'association query failed'
+}
+"#;
+        let dir = std::env::temp_dir().join(format!("multiusb_assoc_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script_path = dir.join("inventory.ps1");
+        let out_path = dir.join("out.json");
+        fs::write(&script_path, format!("{stub}\r\n{INVENTORY_SCRIPT}")).unwrap();
+
+        let output = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script_path)
+            .arg(&out_path)
+            .output()
+            .expect("run inventory");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let json = fs::read_to_string(&out_path).unwrap_or_default();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(
+            !output.status.success(),
+            "a failed association query must not look like a disk without the system volume\nstderr={stderr}\njson={json}"
+        );
+        assert!(
+            stderr.contains("association query failed"),
+            "stderr={stderr}"
+        );
+        assert!(
+            !json.contains("\"ContainsSystem\":false"),
+            "failed query wrote a not-system inventory: {json}"
+        );
+    }
+}
