@@ -104,6 +104,33 @@ pub fn disk_log_name(number: u32, model: &str, serial: Option<&str>) -> String {
     format!("Disk {number} ({model}) · {}", serial_text(serial))
 }
 
+pub fn format_drive_detail(
+    number: u32,
+    model: &str,
+    size: &str,
+    letters: &str,
+    serial: Option<&str>,
+) -> String {
+    format!(
+        "Disk {}  {}  {}  {}  {}",
+        number,
+        model,
+        size,
+        letters,
+        serial_text(serial)
+    )
+}
+
+pub fn format_drive_result(
+    number: u32,
+    model: &str,
+    serial: Option<&str>,
+    status: &str,
+) -> String {
+    format!("{}: {status}", disk_log_name(number, model, serial))
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +270,30 @@ mod tests {
         assert_eq!(
             disk_log_name(2, "Kingston", None),
             "Disk 2 (Kingston) · S/N unavailable"
+        );
+    }
+
+    #[test]
+    fn format_drive_detail_includes_serial_text() {
+        assert!(
+            format_drive_detail(1, "SanDisk", "32.0 GB", "E", Some("ABC123"))
+                .contains("S/N ABC123")
+        );
+        assert!(
+            format_drive_detail(2, "Kingston", "64.0 GB", "no letter", None)
+                .contains("S/N unavailable")
+        );
+    }
+
+    #[test]
+    fn format_drive_result_includes_serial_text() {
+        assert_eq!(
+            format_drive_result(1, "SanDisk", Some("ABC123"), "Passed"),
+            "Disk 1 (SanDisk) · S/N ABC123: Passed"
+        );
+        assert_eq!(
+            format_drive_result(2, "Kingston", None, "Failed"),
+            "Disk 2 (Kingston) · S/N unavailable: Failed"
         );
     }
 }

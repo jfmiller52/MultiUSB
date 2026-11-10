@@ -6,8 +6,8 @@ use crate::job::{
 use crate::label::{Filesystem, LabelError, PartitionStyle, validate_label};
 use crate::log_file::write_run_log;
 use crate::session::{
-    BatchUi, DriveRow, confirmation_body, initial_form, overall_fraction, run_another_batch,
-    start_enabled,
+    BatchUi, DriveRow, confirmation_body, disk_log_name, format_drive_detail, format_drive_result,
+    initial_form, overall_fraction, run_another_batch, start_enabled,
 };
 use crate::source::{EntryKind, SourceEntry, walk_source};
 use crate::windows_host::{CloseGate, WindowsHost, is_elevated, relaunch_elevated};
@@ -338,6 +338,16 @@ impl App {
         });
     }
 
+    fn append_disk_log(&mut self, row_index: usize, message: &str) {
+        let Some(disk) = self.disks.get(row_index) else {
+            return;
+        };
+        self.ui.log.push(format!(
+            "{}: {message}",
+            disk_log_name(disk.number, &disk.model, disk.id.serial.as_deref())
+        ));
+    }
+
     fn relaunch(&mut self, cx: &mut Context<Self>) {
         let message = match std::env::current_exe() {
             Ok(exe) => match relaunch_elevated(&exe) {
@@ -441,15 +451,23 @@ impl App {
     fn on_worker(&mut self, event: JobEvent) {
         match event {
             JobEvent::Prepare(PrepareNotice::Formatting { index, .. }) => {
-                if let Some(run) = self.runs.get_mut(index) {
+                let row_index = self.runs.get_mut(index).map(|run| {
                     run.status = DriveStatus::Formatting;
                     run.fraction = 0.0;
+                    run.row_index
+                });
+                if let Some(row_index) = row_index {
+                    self.append_disk_log(row_index, "Formatting");
                 }
             }
             JobEvent::Prepare(PrepareNotice::Finished { index }) => {
                 self.prepared_done = self.prepared_done.saturating_add(1);
-                if let Some(run) = self.runs.get_mut(index) {
+                let row_index = self.runs.get_mut(index).map(|run| {
                     run.fraction = 1.0;
+                    run.row_index
+                });
+                if let Some(row_index) = row_index {
+                    self.append_disk_log(row_index, "Prepared");
                 }
             }
             JobEvent::Aborted {
@@ -463,6 +481,7 @@ impl App {
             JobEvent::Prepared(results) => {
                 let mut slot = 0usize;
                 let source_bytes = self.source_bytes;
+                let mut failure_logs = Vec::new();
                 for (index, result) in results.into_iter().enumerate() {
                     let Some(run) = self.runs.get_mut(index) else {
                         continue;
@@ -482,9 +501,14 @@ impl App {
                         Err(failure) => {
                             run.status = DriveStatus::Failed;
                             run.fraction = 1.0;
-                            run.prepare_failure = Some(prepare_reason(&failure));
+                            let reason = prepare_reason(&failure);
+                            failure_logs.push((run.row_index, reason.clone()));
+                            run.prepare_failure = Some(reason);
                         }
                     }
+                }
+                for (row_index, reason) in failure_logs {
+                    self.append_disk_log(row_index, &reason);
                 }
                 if self.runs.iter().any(|run| run.reached_copy) {
                     self.phase = Phase::Copying;
@@ -541,23 +565,22 @@ impl App {
     }
 
     fn publish_results(&mut self, lines: Vec<String>) {
+        self.ui.log.extend(lines);
         let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
-        let mut shown = lines.clone();
         match std::env::current_dir() {
             Ok(dir) => {
-                if write_run_log(&dir, &stamp, &lines).is_err() {
-                    shown.push(
+                if write_run_log(&dir, &stamp, &self.ui.log).is_err() {
+                    self.ui.log.push(
                         "Logs could not be created in the current working directory.".to_string(),
                     );
                 }
             }
             Err(_) => {
-                shown.push(
+                self.ui.log.push(
                     "Logs could not be created in the current working directory.".to_string(),
                 );
             }
         }
-        self.ui.log = shown;
         self.ui.show_another = true;
         self.phase = Phase::Done;
         if self.gate.is_requested() {
@@ -973,16 +996,36 @@ fn result_lines(
         let Some(disk) = disks.get(run.row_index) else {
             continue;
         };
-        let name = format!("Disk {} ({})", disk.number, disk.model);
+        let serial = disk.id.serial.as_deref();
         if let Some(reason) = &run.prepare_failure {
-            lines.push(format!("{name}: {reason}"));
+            lines.push(format_drive_result(
+                disk.number,
+                &disk.model,
+                serial,
+                reason,
+            ));
             continue;
         }
         if let Some(slot) = run.copy_slot {
             match outcomes.get(slot) {
-                Some(DriveOutcome::Passed { .. }) => lines.push(format!("{name}: Passed")),
-                Some(DriveOutcome::Failed { reason }) => lines.push(format!("{name}: {reason}")),
-                None => lines.push(format!("{name}: Failed")),
+                Some(DriveOutcome::Passed { .. }) => lines.push(format_drive_result(
+                    disk.number,
+                    &disk.model,
+                    serial,
+                    "Passed",
+                )),
+                Some(DriveOutcome::Failed { reason }) => lines.push(format_drive_result(
+                    disk.number,
+                    &disk.model,
+                    serial,
+                    reason,
+                )),
+                None => lines.push(format_drive_result(
+                    disk.number,
+                    &disk.model,
+                    serial,
+                    "Failed",
+                )),
             }
         }
     }
@@ -1004,9 +1047,12 @@ fn drive_row(disk: &EnumeratedDisk) -> DriveRow {
         key: disk_key(disk),
         checked: false,
         model: format!("Disk {} {} {}", disk.number, disk.model, size),
-        detail: format!(
-            "Disk {}  {}  {}  {}",
-            disk.number, disk.model, size, letters
+        detail: format_drive_detail(
+            disk.number,
+            &disk.model,
+            &size,
+            &letters,
+            disk.id.serial.as_deref(),
         ),
     }
 }
