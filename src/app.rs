@@ -18,6 +18,7 @@ use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::progress::Progress;
+use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Theme, ThemeMode, WindowExt};
@@ -106,6 +107,7 @@ pub struct App {
     label: Entity<InputState>,
     filesystem: Entity<SelectState<Vec<&'static str>>>,
     partition: Entity<SelectState<Vec<&'static str>>>,
+    disk_log_split: Entity<ResizableState>,
     events: Arc<Mutex<futures::channel::mpsc::UnboundedSender<JobEvent>>>,
     _listener: Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -128,10 +130,10 @@ pub fn run() {
             gpui_kit::open_window(
                 gpui_kit::WindowOptions {
                     window_bounds: Some(gpui_kit::WindowBounds::centered(
-                        gpui_kit::size(px(760.), px(900.)),
+                        gpui_kit::size(px(760.), px(640.)),
                         cx,
                     )),
-                    window_min_size: Some(gpui_kit::size(px(560.), px(640.))),
+                    window_min_size: Some(gpui_kit::size(px(560.), px(480.))),
                     ..Default::default()
                 },
                 cx,
@@ -239,6 +241,7 @@ impl App {
             false
         });
 
+        let disk_log_split = cx.new(|_| ResizableState::default());
         let mut app = Self {
             ui: BatchUi {
                 form: initial_form(),
@@ -259,6 +262,7 @@ impl App {
             label,
             filesystem,
             partition,
+            disk_log_split,
             events,
             _listener: listener,
             _subscriptions: subscriptions,
@@ -623,46 +627,62 @@ impl Render for App {
         }
 
         let show_log = !self.ui.log.is_empty() || self.phase != Phase::Idle;
-        let mut stage = h_flex()
-            .id("disk-log-split")
-            .w_full()
-            .flex_1()
+        let disks_pane = v_flex()
+            .id("disks-pane")
+            .size_full()
+            .min_w_0()
             .min_h(px(0.))
             .gap_2()
-            .items_stretch()
-            .child(
-                v_flex()
-                    .id("disks-pane")
-                    .flex_1()
-                    .min_w_0()
-                    .min_h(px(0.))
-                    .h_full()
-                    .gap_2()
-                    .p_2()
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .rounded(cx.theme().radius)
-                    .bg(cx.theme().secondary)
-                    .child(self.disk_list(locked, cx)),
-            );
-        if show_log {
-            stage = stage.child(
-                v_flex()
-                    .id("log-pane")
-                    .w(px(280.))
-                    .min_w(px(220.))
-                    .max_w(px(340.))
-                    .min_h(px(0.))
-                    .h_full()
-                    .gap_2()
-                    .p_2()
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .rounded(cx.theme().radius)
-                    .bg(cx.theme().secondary)
-                    .child(self.log_block(cx)),
-            );
-        }
+            .p_2()
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().secondary)
+            .child(self.disk_list(locked, cx));
+        let stage = if show_log {
+            let log_pane = v_flex()
+                .id("log-pane")
+                .size_full()
+                .min_w_0()
+                .min_h(px(0.))
+                .gap_2()
+                .p_2()
+                .border_1()
+                .border_color(cx.theme().border)
+                .rounded(cx.theme().radius)
+                .bg(cx.theme().secondary)
+                .child(self.log_block(cx));
+            div()
+                .id("disk-log-split")
+                .w_full()
+                .flex_1()
+                .min_h(px(0.))
+                .child(
+                    h_resizable("disk-log-panels")
+                        .with_state(&self.disk_log_split)
+                        .child(
+                            resizable_panel()
+                                .size(px(460.))
+                                .size_range(px(240.)..px(1200.))
+                                .child(disks_pane),
+                        )
+                        .child(
+                            resizable_panel()
+                                .size(px(280.))
+                                .size_range(px(180.)..px(560.))
+                                .child(log_pane),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .id("disk-log-split")
+                .w_full()
+                .flex_1()
+                .min_h(px(0.))
+                .child(disks_pane)
+                .into_any_element()
+        };
         column = column.child(stage);
 
         let checked = self.ui.rows.iter().filter(|row| row.checked).count();
