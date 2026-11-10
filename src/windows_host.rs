@@ -351,27 +351,19 @@ fn lock_volume_with_retries(
 
     let sleep_ms = DRIVE_ACCESS_TIMEOUT_MS / u64::from(DRIVE_ACCESS_RETRIES);
     let deadline = Instant::now() + Duration::from_millis(DRIVE_ACCESS_TIMEOUT_MS);
-    let mut last_err = None;
     loop {
         match unsafe {
             DeviceIoControl(handle, FSCTL_LOCK_VOLUME, None, 0, None, 0, None, None)
         } {
             Ok(()) => return Ok(()),
             Err(err) => {
-                last_err = Some(err);
                 if Instant::now() >= deadline {
-                    break;
+                    return Err(format!("lock {path}: {err}"));
                 }
                 std::thread::sleep(Duration::from_millis(sleep_ms));
             }
         }
     }
-    Err(format!(
-        "lock {path}: {}",
-        last_err
-            .map(|err| err.to_string())
-            .unwrap_or_else(|| "timed out".to_string())
-    ))
 }
 
 #[cfg(windows)]
@@ -426,26 +418,95 @@ fn first_partition_extent(physical: &std::fs::File) -> Result<(u64, u64), String
 }
 
 #[cfg(windows)]
-fn format_large_fat32_volume_windows(
-    disk_number: u32,
-    letter: char,
+fn volume_length_bytes(volume: &std::fs::File, path: &str) -> Result<i64, String> {
+    use std::mem::size_of_val;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::IO::DeviceIoControl;
+    use windows::Win32::System::Ioctl::{GET_LENGTH_INFORMATION, IOCTL_DISK_GET_LENGTH_INFO};
+
+    let handle = HANDLE(volume.as_raw_handle());
+    let mut length_info = GET_LENGTH_INFORMATION::default();
+    let mut returned = 0u32;
+    unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_DISK_GET_LENGTH_INFO,
+            None,
+            0,
+            Some(&mut length_info as *mut _ as *mut _),
+            size_of_val(&length_info) as u32,
+            Some(&mut returned),
+            None,
+        )
+        .map_err(|err| format!("volume length {path}: {err}"))?;
+    }
+    Ok(length_info.Length)
+}
+
+#[cfg(windows)]
+fn format_fat32_on_file(
+    file: &mut std::fs::File,
+    path: &str,
+    total_sectors: u32,
     label: &str,
 ) -> Result<(), String> {
     use std::io::{Seek, SeekFrom};
+
+    let mut io = crate::sector_io::SectorIo::new(file, 512);
+    io.seek(SeekFrom::Start(0))
+        .map_err(|err| format!("seek {path}: {err}"))?;
+    let options = fatfs::FormatVolumeOptions::new()
+        .fat_type(fatfs::FatType::Fat32)
+        .bytes_per_sector(512)
+        .total_sectors(total_sectors)
+        .volume_label(pad_fat_volume_label(label));
+    fatfs::format_volume(&mut io, options).map_err(|err| format!("fatfs format {path}: {err}"))?;
+    let file = io.into_inner();
+    file.sync_all()
+        .map_err(|err| format!("flush {path}: {err}"))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn format_fat32_on_partition_view(
+    physical: std::fs::File,
+    path: &str,
+    offset: u64,
+    length: u64,
+    label: &str,
+) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom};
+
+    let total_sectors = fat32_total_sectors(length as i64)
+        .map_err(|reason| format!("partition length on {path}: {reason}"))?;
+    let view = crate::sector_io::PartitionView::new(physical, offset, length);
+    let mut io = crate::sector_io::SectorIo::new(view, 512);
+    io.seek(SeekFrom::Start(0))
+        .map_err(|err| format!("seek {path}+{offset}: {err}"))?;
+    let options = fatfs::FormatVolumeOptions::new()
+        .fat_type(fatfs::FatType::Fat32)
+        .bytes_per_sector(512)
+        .total_sectors(total_sectors)
+        .volume_label(pad_fat_volume_label(label));
+    fatfs::format_volume(&mut io, options)
+        .map_err(|err| format!("fatfs format {path} offset {offset}: {err}"))?;
+    let physical = io.into_inner().into_inner();
+    physical
+        .sync_all()
+        .map_err(|err| format!("flush {path}: {err}"))?;
+    Ok(())
+}
+
+/// Rufus path: write FAT32 through the same volume handle that is locked+dismounted.
+#[cfg(windows)]
+fn format_via_locked_volume(letter: char, label: &str) -> Result<(), String> {
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::IO::DeviceIoControl;
     use windows::Win32::System::Ioctl::{FSCTL_DISMOUNT_VOLUME, FSCTL_UNLOCK_VOLUME};
 
-    let physical_path = format!(r"\\.\PhysicalDrive{disk_number}");
     let volume_path = format!(r"\\.\{letter}:");
-
-    // Rufus FormatLargeFAT32 sequence on the logical volume:
-    //   open (exclusive write preferred) → ALLOW_EXTENDED_DASD_IO →
-    //   LOCK_VOLUME (retried) → DISMOUNT_VOLUME → write sectors.
-    // We keep that volume guard, then write through PhysicalDrive at the
-    // partition offset because post-diskpart `\\.\X:` writes have failed with
-    // os error 433 on real USB sticks even after lock.
     let volume = open_device_rw(&volume_path)?;
     let volume_handle = HANDLE(volume.as_raw_handle());
     let unlock = || unsafe {
@@ -466,7 +527,7 @@ fn format_large_fat32_volume_windows(
         unlock();
         return Err(err);
     }
-    // Rufus ignores dismount failure and continues; lock is the hard requirement.
+    // Rufus always dismounts, then writes on this same handle (not a second open).
     unsafe {
         let _ = DeviceIoControl(
             volume_handle,
@@ -480,53 +541,96 @@ fn format_large_fat32_volume_windows(
         );
     }
 
-    let physical = match open_device_rw(&physical_path) {
-        Ok(file) => file,
+    let length = match volume_length_bytes(&volume, &volume_path) {
+        Ok(length) => length,
         Err(err) => {
             unlock();
             return Err(err);
         }
     };
-    let (offset, length) = match first_partition_extent(&physical) {
-        Ok(extent) => extent,
-        Err(err) => {
-            unlock();
-            return Err(err);
-        }
-    };
-    let total_sectors = match fat32_total_sectors(length as i64) {
+    let total_sectors = match fat32_total_sectors(length) {
         Ok(sectors) => sectors,
         Err(reason) => {
             unlock();
-            return Err(format!("partition length on {physical_path}: {reason}"));
+            return Err(format!("volume length {volume_path}: {reason}"));
         }
     };
 
-    let view = crate::sector_io::PartitionView::new(physical, offset, length);
-    let mut volume_io = crate::sector_io::SectorIo::new(view, 512);
-    if let Err(err) = volume_io.seek(SeekFrom::Start(0)) {
-        unlock();
-        return Err(format!("seek {physical_path}+{offset}: {err}"));
-    }
-    let options = fatfs::FormatVolumeOptions::new()
-        .fat_type(fatfs::FatType::Fat32)
-        .bytes_per_sector(512)
-        .total_sectors(total_sectors)
-        .volume_label(pad_fat_volume_label(label));
-    let format_result = fatfs::format_volume(&mut volume_io, options).map_err(|err| {
-        format!("fatfs format {physical_path} offset {offset}: {err}")
-    });
-    let physical = volume_io.into_inner().into_inner();
-    if format_result.is_ok() {
-        if let Err(err) = physical.sync_all() {
-            unlock();
-            return Err(format!("flush {physical_path}: {err}"));
-        }
-    }
+    let mut volume = volume;
+    let result = format_fat32_on_file(&mut volume, &volume_path, total_sectors, label);
     unlock();
-    // Keep `volume` alive until unlock so the lock handle stays valid.
     drop(volume);
-    format_result
+    result
+}
+
+/// Fallback: open PhysicalDrive *before* touching the volume, lock the letter
+/// without dismounting, then write at the partition offset.
+///
+/// Opening PhysicalDrive after `FSCTL_DISMOUNT_VOLUME` has failed with os error
+/// 433 on removable USB (device evaporates for the second handle).
+#[cfg(windows)]
+fn format_via_physical_while_volume_locked(
+    disk_number: u32,
+    letter: char,
+    label: &str,
+) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::IO::DeviceIoControl;
+    use windows::Win32::System::Ioctl::FSCTL_UNLOCK_VOLUME;
+
+    let physical_path = format!(r"\\.\PhysicalDrive{disk_number}");
+    let volume_path = format!(r"\\.\{letter}:");
+
+    let physical = open_device_rw(&physical_path)?;
+    let (offset, length) = first_partition_extent(&physical)?;
+
+    let volume = open_device_rw(&volume_path)?;
+    let volume_handle = HANDLE(volume.as_raw_handle());
+    let unlock = || unsafe {
+        let _ = DeviceIoControl(
+            volume_handle,
+            FSCTL_UNLOCK_VOLUME,
+            None,
+            0,
+            None,
+            0,
+            None,
+            None,
+        );
+    };
+
+    allow_extended_dasd_io(volume_handle);
+    if let Err(err) = lock_volume_with_retries(volume_handle, &volume_path) {
+        unlock();
+        return Err(err);
+    }
+    // Intentionally no dismount: that was poisoning PhysicalDrive writes (433).
+
+    let result = format_fat32_on_partition_view(physical, &physical_path, offset, length, label);
+    unlock();
+    drop(volume);
+    result
+}
+
+#[cfg(windows)]
+fn format_large_fat32_volume_windows(
+    disk_number: u32,
+    letter: char,
+    label: &str,
+) -> Result<(), String> {
+    // Primary: Rufus-style writes on the locked+dismounted volume handle.
+    // Fallback: PhysicalDrive opened first, volume locked without dismount.
+    match format_via_locked_volume(letter, label) {
+        Ok(()) => Ok(()),
+        Err(volume_err) => match format_via_physical_while_volume_locked(disk_number, letter, label)
+        {
+            Ok(()) => Ok(()),
+            Err(physical_err) => Err(format!(
+                "{volume_err}; physical fallback: {physical_err}"
+            )),
+        },
+    }
 }
 
 fn same_identity(disk: &EnumeratedDisk, id: &DiskId) -> bool {
