@@ -117,6 +117,11 @@ impl VolumeHost for WindowsHost {
         }
     }
 
+    fn free_drive_letter(&mut self) -> Result<char, String> {
+        self.stop_if_closed();
+        free_drive_letter()
+    }
+
     fn run_command(&mut self, cmd: &ExternalCommand) -> Result<(), String> {
         self.stop_if_closed();
         let mut child = hidden_command(&cmd.program)
@@ -196,6 +201,28 @@ pub fn relaunch_elevated(exe: &Path) -> std::io::Result<()> {
     }
 }
 
+fn free_drive_letter() -> Result<char, String> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Storage::FileSystem::GetLogicalDrives;
+        let mask = unsafe { GetLogicalDrives() };
+        if mask == 0 {
+            return Err("could not read logical drives".to_string());
+        }
+        // Prefer D–Z; A/B are floppy legacy and C is almost always the system volume.
+        for index in 3u32..26 {
+            if mask & (1u32 << index) == 0 {
+                return Ok(char::from(b'A' + index as u8));
+            }
+        }
+        Err("no free drive letter".to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        Err("drive letters require Windows".to_string())
+    }
+}
+
 fn pad_fat_volume_label(label: &str) -> [u8; 11] {
     let mut out = [b' '; 11];
     for (dst, src) in out.iter_mut().zip(label.bytes()) {
@@ -244,13 +271,42 @@ fn format_large_fat32_volume_windows(letter: char, label: &str) -> Result<(), St
     };
 
     let path = format!(r"\\.\{letter}:");
-    // Lock requires share read/write on the open handle.
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
-        .open(&path)
-        .map_err(|err| format!("open {path}: {err}"))?;
+    // Lock requires share read/write on the open handle. Retry briefly while
+    // Windows finishes creating the volume after `assign letter=`.
+    let file = {
+        let mut last_err = None;
+        let mut opened = None;
+        for attempt in 0..10 {
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
+                .open(&path)
+            {
+                Ok(file) => {
+                    opened = Some(file);
+                    break;
+                }
+                Err(err) => {
+                    last_err = Some(err);
+                    if attempt + 1 < 10 {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                }
+            }
+        }
+        match opened {
+            Some(file) => file,
+            None => {
+                return Err(format!(
+                    "open {path}: {}",
+                    last_err.map(|err| err.to_string()).unwrap_or_else(|| {
+                        "volume did not appear after assign".to_string()
+                    })
+                ));
+            }
+        }
+    };
 
     let handle = HANDLE(file.as_raw_handle());
     let unlock = || unsafe {

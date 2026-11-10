@@ -1183,12 +1183,13 @@ fn result_lines(
             continue;
         };
         let serial = disk.id.serial.as_deref();
-        if let Some(reason) = &run.prepare_failure {
+        if run.prepare_failure.is_some() {
+            // Reason was already appended to the live log during prepare.
             lines.push(format_drive_result(
                 disk.number,
                 &disk.model,
                 serial,
-                reason,
+                "Failed",
             ));
             continue;
         }

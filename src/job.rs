@@ -11,6 +11,8 @@ pub trait VolumeHost {
     fn list_all(&mut self) -> Result<Vec<EnumeratedDisk>, String>;
     fn diskpart(&mut self, script: &str) -> Result<(), String>;
     fn letter_for(&mut self, id: &DiskId) -> Result<Option<char>, String>;
+    /// Next unused drive letter (D–Z) for an explicit `diskpart assign letter=`.
+    fn free_drive_letter(&mut self) -> Result<char, String>;
     fn run_command(&mut self, cmd: &ExternalCommand) -> Result<(), String>;
     fn format_large_fat32(&mut self, letter: char, label: &str) -> Result<(), String>;
     fn exe_path(&self) -> PathBuf;
@@ -212,14 +214,16 @@ fn finish_script(
     disk: &EnumeratedDisk,
     script: &str,
 ) -> (Result<Prepared, PrepareFailure>, Option<CleanedDisk>) {
-    if host.diskpart(script).is_err() {
+    let letter = match host.free_drive_letter() {
+        Ok(letter) => letter,
+        Err(_) => return (Err(PrepareFailure::NoLetter), None),
+    };
+    let script = with_assign_letter(script, letter);
+    if host.diskpart(&script).is_err() {
         return (Err(PrepareFailure::Diskpart), None);
     }
     let cleaned = Some(cleaned_disk(disk));
-    match take_letter(host, &disk.id) {
-        Ok(letter) => (Ok(prepared_disk(disk, letter)), cleaned),
-        Err(failure) => (Err(failure), cleaned),
-    }
+    (Ok(prepared_disk(disk, letter)), cleaned)
 }
 
 fn finish_large_fat32(
@@ -228,18 +232,23 @@ fn finish_large_fat32(
     script: &str,
     label: &str,
 ) -> (Result<Prepared, PrepareFailure>, Option<CleanedDisk>) {
-    if host.diskpart(script).is_err() {
+    let letter = match host.free_drive_letter() {
+        Ok(letter) => letter,
+        Err(_) => return (Err(PrepareFailure::NoLetter), None),
+    };
+    let script = with_assign_letter(script, letter);
+    if host.diskpart(&script).is_err() {
         return (Err(PrepareFailure::Diskpart), None);
     }
     let cleaned = Some(cleaned_disk(disk));
-    let letter = match take_letter(host, &disk.id) {
-        Ok(letter) => letter,
-        Err(failure) => return (Err(failure), cleaned),
-    };
     if let Err(message) = host.format_large_fat32(letter, label) {
         return (Err(PrepareFailure::Command(message)), cleaned);
     }
     (Ok(prepared_disk(disk, letter)), cleaned)
+}
+
+fn with_assign_letter(script: &str, letter: char) -> String {
+    script.replace("assign\r\n", &format!("assign letter={letter}\r\n"))
 }
 
 fn cleaned_disk(disk: &EnumeratedDisk) -> CleanedDisk {
@@ -247,14 +256,6 @@ fn cleaned_disk(disk: &EnumeratedDisk) -> CleanedDisk {
         number: disk.number,
         model: disk.model.clone(),
         serial: disk.id.serial.clone(),
-    }
-}
-
-fn take_letter(host: &mut dyn VolumeHost, id: &DiskId) -> Result<char, PrepareFailure> {
-    match host.letter_for(id) {
-        Ok(Some(letter)) => Ok(letter),
-        Ok(None) => Err(PrepareFailure::NoLetter),
-        Err(message) => Err(PrepareFailure::Command(message)),
     }
 }
 
@@ -403,6 +404,7 @@ mod tests {
         format_calls: Vec<(char, String)>,
         format_error: Option<String>,
         format_errors_queue: Vec<String>,
+        free_letters: Vec<char>,
         exe: PathBuf,
         log: Arc<Mutex<Vec<Mark>>>,
     }
@@ -420,6 +422,7 @@ mod tests {
                 format_calls: Vec::new(),
                 format_error: None,
                 format_errors_queue: Vec::new(),
+                free_letters: Vec::new(),
                 exe: PathBuf::from(r"C:\MultiUSBTest\MultiUSB.exe"),
                 log: Arc::new(Mutex::new(Vec::new())),
             }
@@ -427,6 +430,10 @@ mod tests {
 
         fn letter(&mut self, pnp: &str, letter: char) {
             self.letters.push((pnp.to_string(), Ok(Some(letter))));
+        }
+
+        fn free_letter(&mut self, letter: char) {
+            self.free_letters.push(letter);
         }
     }
 
@@ -473,6 +480,14 @@ mod tests {
             match &self.command_error {
                 Some(message) => Err(message.clone()),
                 None => Ok(()),
+            }
+        }
+
+        fn free_drive_letter(&mut self) -> Result<char, String> {
+            if self.free_letters.is_empty() {
+                Err("no free drive letter".into())
+            } else {
+                Ok(self.free_letters.remove(0))
             }
         }
 
@@ -533,6 +548,19 @@ mod tests {
         format!(
             "rescan\r\nselect disk {number}\r\nclean\r\nconvert {convert}\r\ncreate partition primary\r\nassign\r\nexit\r\n"
         )
+    }
+
+    fn assign_letter_script(number: u32, convert: &str, letter: char) -> String {
+        with_assign_letter(&assign_only_script(number, convert), letter)
+    }
+
+    fn format_assign_letter_script(
+        number: u32,
+        convert: &str,
+        format_line: &str,
+        letter: char,
+    ) -> String {
+        with_assign_letter(&diskpart_script(number, convert, format_line), letter)
     }
 
     fn notices(host: &FakeHost) -> impl FnMut(PrepareNotice) + use<> {
@@ -617,7 +645,7 @@ mod tests {
         let small = removable(3, "Small", "USB\\SMALL", 1024);
         let selected = ids(&[big.clone(), small.clone()]);
         let mut host = FakeHost::new(vec![Ok(vec![big, small])]);
-        host.letter("USB\\SMALL", 'F');
+        host.free_letter('F');
         let mut on_prepare = notices(&host);
 
         let result = prepare_all(
@@ -645,10 +673,11 @@ mod tests {
         }
         assert_eq!(
             host.scripts,
-            vec![diskpart_script(
+            vec![format_assign_letter_script(
                 3,
                 "gpt",
-                "format fs=fat32 quick label=\"STORE\""
+                "format fs=fat32 quick label=\"STORE\"",
+                'F'
             )]
         );
         assert_eq!(
@@ -670,7 +699,8 @@ mod tests {
         let selected = ids(&[first.clone(), second.clone()]);
         let mut host = FakeHost::new(vec![Ok(vec![first, second])]);
         host.fail_diskpart_for = vec![3];
-        host.letter("USB\\TWO", 'G');
+        host.free_letter('G');
+        host.free_letter('H');
         let mut on_prepare = notices(&host);
 
         let result = prepare_all(
@@ -687,7 +717,7 @@ mod tests {
                 assert!(matches!(results[0], Err(PrepareFailure::Diskpart)));
                 assert!(matches!(
                     &results[1],
-                    Ok(prepared) if prepared.letter == 'G' && prepared.model == "Two"
+                    Ok(prepared) if prepared.letter == 'H' && prepared.model == "Two"
                 ));
             }
             PrepareAll::AbortSystemDisk { .. } => panic!("expected both disks to finish"),
@@ -695,8 +725,18 @@ mod tests {
         assert_eq!(
             host.scripts,
             vec![
-                diskpart_script(3, "gpt", "format fs=ntfs quick label=\"STORE\""),
-                diskpart_script(4, "gpt", "format fs=ntfs quick label=\"STORE\""),
+                format_assign_letter_script(
+                    3,
+                    "gpt",
+                    "format fs=ntfs quick label=\"STORE\"",
+                    'G'
+                ),
+                format_assign_letter_script(
+                    4,
+                    "gpt",
+                    "format fs=ntfs quick label=\"STORE\"",
+                    'H'
+                ),
             ]
         );
         assert_eq!(
@@ -717,7 +757,7 @@ mod tests {
         let stick = removable(4, "Wide", "USB\\WIDE", 1024);
         let selected = ids(&[stick.clone()]);
         let mut host = FakeHost::new(vec![Ok(vec![stick])]);
-        host.letter("USB\\WIDE", 'E');
+        host.free_letter('E');
         let mut on_prepare = notices(&host);
 
         let result = prepare_all(
@@ -739,7 +779,7 @@ mod tests {
             },
             PrepareAll::AbortSystemDisk { .. } => panic!("expected the disk to finish"),
         }
-        assert_eq!(host.scripts, vec![assign_only_script(4, "mbr")]);
+        assert_eq!(host.scripts, vec![assign_letter_script(4, "mbr", 'E')]);
         assert_eq!(host.format_calls, vec![('E', "STORE".to_string())]);
         assert!(host.commands.is_empty());
     }
@@ -749,7 +789,7 @@ mod tests {
         let stick = removable(4, "Wide", "USB\\WIDE", FAT32_MAX_INCLUSIVE_BYTES + 1);
         let selected = ids(&[stick.clone()]);
         let mut host = FakeHost::new(vec![Ok(vec![stick])]);
-        host.letter("USB\\WIDE", 'E');
+        host.free_letter('E');
         host.format_error = Some("lock failed".to_string());
         let mut on_prepare = notices(&host);
 
@@ -769,7 +809,7 @@ mod tests {
             },
             PrepareAll::AbortSystemDisk { .. } => panic!("expected the disk to finish"),
         }
-        assert_eq!(host.scripts, vec![assign_only_script(4, "gpt")]);
+        assert_eq!(host.scripts, vec![assign_letter_script(4, "gpt", 'E')]);
         assert_eq!(host.format_calls, vec![('E', "STORE".to_string())]);
         assert!(host.commands.is_empty());
     }
@@ -780,8 +820,8 @@ mod tests {
         let second = removable(5, "Narrow", "USB\\NARROW", 1024);
         let selected = ids(&[first.clone(), second.clone()]);
         let mut host = FakeHost::new(vec![Ok(vec![first, second])]);
-        host.letter("USB\\WIDE", 'E');
-        host.letter("USB\\NARROW", 'F');
+        host.free_letter('E');
+        host.free_letter('F');
         host.format_errors_queue
             .push("lock failed".to_string());
         let mut on_prepare = notices(&host);
@@ -810,7 +850,10 @@ mod tests {
         }
         assert_eq!(
             host.scripts,
-            vec![assign_only_script(4, "gpt"), assign_only_script(5, "gpt")]
+            vec![
+                assign_letter_script(4, "gpt", 'E'),
+                assign_letter_script(5, "gpt", 'F')
+            ]
         );
         assert_eq!(
             host.format_calls,
@@ -823,7 +866,7 @@ mod tests {
         let stick = removable(2, "Stick", "USB\\A", 100);
         let selected = ids(&[stick.clone()]);
         let mut host = FakeHost::new(vec![Ok(vec![stick])]);
-        host.letter("USB\\A", 'F');
+        host.free_letter('F');
         let mut on_prepare = notices(&host);
 
         let result = prepare_all(
@@ -891,7 +934,7 @@ mod tests {
             Ok(vec![first, second]),
             Ok(vec![removable(1, "Safe", "USB\\A", 100), second_system]),
         ]);
-        host.letter("USB\\A", 'E');
+        host.free_letter('E');
         let mut on_prepare = notices(&host);
 
         let result = prepare_all(
@@ -909,10 +952,11 @@ mod tests {
         ));
         assert_eq!(
             host.scripts,
-            vec![diskpart_script(
+            vec![format_assign_letter_script(
                 1,
                 "gpt",
-                "format fs=ntfs quick label=\"STORE\""
+                "format fs=ntfs quick label=\"STORE\"",
+                'E'
             )]
         );
         assert_eq!(
@@ -943,7 +987,7 @@ mod tests {
                 third,
             ]),
         ]);
-        host.letter("USB\\A", 'E');
+        host.free_letter('E');
         let mut on_prepare = notices(&host);
 
         let result = prepare_all(
@@ -973,10 +1017,11 @@ mod tests {
         }
         assert_eq!(
             host.scripts,
-            vec![diskpart_script(
+            vec![format_assign_letter_script(
                 1,
                 "gpt",
-                "format fs=ntfs quick label=\"STORE\""
+                "format fs=ntfs quick label=\"STORE\"",
+                'E'
             )]
         );
     }
@@ -1029,6 +1074,7 @@ mod tests {
     }
 
     #[test]
+    #[test]
     fn no_letter_after_format_fails_that_disk() {
         let stick = removable(5, "Bare", "USB\\BARE", 100);
         let selected = ids(&[stick.clone()]);
@@ -1050,14 +1096,7 @@ mod tests {
             }
             PrepareAll::AbortSystemDisk { .. } => panic!("expected the disk to finish"),
         }
-        assert_eq!(
-            host.scripts,
-            vec![diskpart_script(
-                5,
-                "gpt",
-                "format fs=exfat quick label=\"STORE\""
-            )]
-        );
+        assert!(host.scripts.is_empty());
         assert!(host.commands.is_empty());
     }
 
@@ -1083,7 +1122,7 @@ mod tests {
             }
             PrepareAll::AbortSystemDisk { .. } => panic!("expected the disk to finish"),
         }
-        assert_eq!(host.scripts, vec![assign_only_script(4, "gpt")]);
+        assert!(host.scripts.is_empty());
         assert!(host.format_calls.is_empty());
         assert!(host.commands.is_empty());
     }
@@ -1125,7 +1164,7 @@ mod tests {
             Err("relist failed".to_string()),
             Ok(vec![first, second]),
         ]);
-        host.letter("USB\\TWO", 'H');
+        host.free_letter('H');
         let mut on_prepare = notices(&host);
 
         let result = prepare_all(
@@ -1152,44 +1191,21 @@ mod tests {
         }
         assert_eq!(
             host.scripts,
-            vec![diskpart_script(
+            vec![format_assign_letter_script(
                 2,
                 "mbr",
-                "format fs=ntfs quick label=\"STORE\""
+                "format fs=ntfs quick label=\"STORE\"",
+                'H'
             )]
         );
     }
 
     #[test]
-    fn letter_query_error_is_the_disk_reason() {
-        let stick = removable(5, "Bare", "USB\\BARE", 100);
-        let selected = ids(&[stick.clone()]);
-        let mut host = FakeHost::new(vec![Ok(vec![stick])]);
-        host.letters.push((
-            "USB\\BARE".to_string(),
-            Err("letter query failed".to_string()),
-        ));
-        let mut on_prepare = notices(&host);
-
-        let result = prepare_all(
-            &selected,
-            Filesystem::Ntfs,
-            PartitionStyle::Gpt,
-            "STORE",
-            &mut host,
-            &mut on_prepare,
+    fn with_assign_letter_rewrites_diskpart_assign_line() {
+        assert_eq!(
+            with_assign_letter(&assign_only_script(4, "gpt"), 'E'),
+            assign_letter_script(4, "gpt", 'E')
         );
-
-        match result {
-            PrepareAll::Done(results) => match &results[0] {
-                Err(PrepareFailure::Command(message)) => {
-                    assert_eq!(message, "letter query failed");
-                }
-                other => panic!("expected the query error, got {other:?}"),
-            },
-            PrepareAll::AbortSystemDisk { .. } => panic!("expected the disk to finish"),
-        }
-        assert_eq!(host.scripts.len(), 1);
     }
 
     #[test]
