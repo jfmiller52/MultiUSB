@@ -402,6 +402,7 @@ mod tests {
         command_error: Option<String>,
         format_calls: Vec<(char, String)>,
         format_error: Option<String>,
+        format_errors_queue: Vec<String>,
         exe: PathBuf,
         log: Arc<Mutex<Vec<Mark>>>,
     }
@@ -418,6 +419,7 @@ mod tests {
                 command_error: None,
                 format_calls: Vec::new(),
                 format_error: None,
+                format_errors_queue: Vec::new(),
                 exe: PathBuf::from(r"C:\MultiUSBTest\MultiUSB.exe"),
                 log: Arc::new(Mutex::new(Vec::new())),
             }
@@ -476,6 +478,9 @@ mod tests {
 
         fn format_large_fat32(&mut self, letter: char, label: &str) -> Result<(), String> {
             self.format_calls.push((letter, label.to_string()));
+            if !self.format_errors_queue.is_empty() {
+                return Err(self.format_errors_queue.remove(0));
+            }
             match &self.format_error {
                 Some(message) => Err(message.clone()),
                 None => Ok(()),
@@ -767,6 +772,50 @@ mod tests {
         assert_eq!(host.scripts, vec![assign_only_script(4, "gpt")]);
         assert_eq!(host.format_calls, vec![('E', "STORE".to_string())]);
         assert!(host.commands.is_empty());
+    }
+
+    #[test]
+    fn large_fat32_format_error_on_first_disk_still_prepares_second() {
+        let first = removable(4, "Wide", "USB\\WIDE", 1024);
+        let second = removable(5, "Narrow", "USB\\NARROW", 1024);
+        let selected = ids(&[first.clone(), second.clone()]);
+        let mut host = FakeHost::new(vec![Ok(vec![first, second])]);
+        host.letter("USB\\WIDE", 'E');
+        host.letter("USB\\NARROW", 'F');
+        host.format_errors_queue
+            .push("lock failed".to_string());
+        let mut on_prepare = notices(&host);
+
+        let result = prepare_all(
+            &selected,
+            Filesystem::LargeFat32,
+            PartitionStyle::Gpt,
+            "STORE",
+            &mut host,
+            &mut on_prepare,
+        );
+
+        match result {
+            PrepareAll::Done(results) => {
+                assert!(matches!(
+                    &results[0],
+                    Err(PrepareFailure::Command(message)) if message == "lock failed"
+                ));
+                assert!(matches!(
+                    &results[1],
+                    Ok(prepared) if prepared.letter == 'F'
+                ));
+            }
+            PrepareAll::AbortSystemDisk { .. } => panic!("expected both disks to finish"),
+        }
+        assert_eq!(
+            host.scripts,
+            vec![assign_only_script(4, "gpt"), assign_only_script(5, "gpt")]
+        );
+        assert_eq!(
+            host.format_calls,
+            vec![('E', "STORE".to_string()), ('F', "STORE".to_string())]
+        );
     }
 
     #[test]

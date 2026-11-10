@@ -204,6 +204,18 @@ fn pad_fat_volume_label(label: &str) -> [u8; 11] {
     out
 }
 
+fn fat32_total_sectors(length_bytes: i64) -> Result<u32, &'static str> {
+    const BYTES_PER_SECTOR: u64 = 512;
+    if length_bytes <= 0 {
+        return Err("non-positive size");
+    }
+    let total_sectors = (length_bytes as u64) / BYTES_PER_SECTOR;
+    if total_sectors == 0 || total_sectors > u64::from(u32::MAX) {
+        return Err("unsupported sector count");
+    }
+    Ok(total_sectors as u32)
+}
+
 fn format_large_fat32_volume(letter: char, label: &str) -> Result<(), String> {
     #[cfg(windows)]
     {
@@ -220,12 +232,16 @@ fn format_large_fat32_volume(letter: char, label: &str) -> Result<(), String> {
 fn format_large_fat32_volume_windows(letter: char, label: &str) -> Result<(), String> {
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom};
+    use std::mem::size_of_val;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
     use windows::Win32::System::IO::DeviceIoControl;
-    use windows::Win32::System::Ioctl::{FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME, FSCTL_UNLOCK_VOLUME};
+    use windows::Win32::System::Ioctl::{
+        FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME, FSCTL_UNLOCK_VOLUME, GET_LENGTH_INFORMATION,
+        IOCTL_DISK_GET_LENGTH_INFO,
+    };
 
     let path = format!(r"\\.\{letter}:");
     // Lock requires share read/write on the open handle.
@@ -237,28 +253,65 @@ fn format_large_fat32_volume_windows(letter: char, label: &str) -> Result<(), St
         .map_err(|err| format!("open {path}: {err}"))?;
 
     let handle = HANDLE(file.as_raw_handle());
+    let unlock = || unsafe {
+        let _ = DeviceIoControl(handle, FSCTL_UNLOCK_VOLUME, None, 0, None, 0, None, None);
+    };
+
     unsafe {
         DeviceIoControl(handle, FSCTL_LOCK_VOLUME, None, 0, None, 0, None, None)
             .map_err(|err| format!("lock {path}: {err}"))?;
         if let Err(err) =
             DeviceIoControl(handle, FSCTL_DISMOUNT_VOLUME, None, 0, None, 0, None, None)
         {
-            let _ = DeviceIoControl(handle, FSCTL_UNLOCK_VOLUME, None, 0, None, 0, None, None);
+            unlock();
             return Err(format!("dismount {path}: {err}"));
         }
     }
 
-    file.seek(SeekFrom::Start(0))
-        .map_err(|err| format!("seek {path}: {err}"))?;
+    let mut length_info = GET_LENGTH_INFORMATION::default();
+    let mut returned = 0u32;
+    let length_ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_DISK_GET_LENGTH_INFO,
+            None,
+            0,
+            Some(&mut length_info as *mut _ as *mut _),
+            size_of_val(&length_info) as u32,
+            Some(&mut returned),
+            None,
+        )
+    };
+    if let Err(err) = length_ok {
+        unlock();
+        return Err(format!("volume length {path}: {err}"));
+    }
+    let total_sectors = match fat32_total_sectors(length_info.Length) {
+        Ok(sectors) => sectors,
+        Err(reason) => {
+            unlock();
+            return Err(format!("volume length {path}: {reason}"));
+        }
+    };
+
+    if let Err(err) = file.seek(SeekFrom::Start(0)) {
+        unlock();
+        return Err(format!("seek {path}: {err}"));
+    }
     let options = fatfs::FormatVolumeOptions::new()
         .fat_type(fatfs::FatType::Fat32)
+        .total_sectors(total_sectors)
         .volume_label(pad_fat_volume_label(label));
     let format_result = fatfs::format_volume(&mut file, options)
         .map_err(|err| format!("fatfs format {path}: {err}"));
-
-    unsafe {
-        let _ = DeviceIoControl(handle, FSCTL_UNLOCK_VOLUME, None, 0, None, 0, None, None);
+    if format_result.is_ok() {
+        if let Err(err) = file.sync_all() {
+            unlock();
+            return Err(format!("flush {path}: {err}"));
+        }
     }
+
+    unlock();
     format_result
 }
 
@@ -431,7 +484,7 @@ try {
 
 #[cfg(test)]
 mod tests {
-    use super::{pad_fat_volume_label, INVENTORY_SCRIPT};
+    use super::{fat32_total_sectors, pad_fat_volume_label, INVENTORY_SCRIPT};
     use std::fs;
 
     #[test]
@@ -440,6 +493,14 @@ mod tests {
         assert_eq!(pad_fat_volume_label("STORE"), *b"STORE      ");
         assert_eq!(pad_fat_volume_label("EXACTLYELEV"), *b"EXACTLYELEV");
         assert_eq!(pad_fat_volume_label("TOOLONGVOLUME"), *b"TOOLONGVOLU");
+    }
+
+    #[test]
+    fn fat32_total_sectors_from_volume_length() {
+        assert_eq!(fat32_total_sectors(64 * 1024 * 1024), Ok(131_072));
+        assert!(fat32_total_sectors(0).is_err());
+        assert!(fat32_total_sectors(-1).is_err());
+        assert!(fat32_total_sectors(400).is_err());
     }
 
     #[cfg(windows)]
