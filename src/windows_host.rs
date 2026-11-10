@@ -159,8 +159,8 @@ impl VolumeHost for WindowsHost {
     }
 
     fn format_large_fat32(&mut self, letter: char, label: &str) -> Result<(), String> {
-        let _ = (letter, label);
-        Err("Large FAT32 format is not implemented on this host".to_string())
+        self.stop_if_closed();
+        format_large_fat32_volume(letter, label)
     }
 
     fn exe_path(&self) -> PathBuf {
@@ -194,6 +194,72 @@ pub fn relaunch_elevated(exe: &Path) -> std::io::Result<()> {
     } else {
         Err(std::io::Error::from_raw_os_error(code.max(1) as i32))
     }
+}
+
+fn pad_fat_volume_label(label: &str) -> [u8; 11] {
+    let mut out = [b' '; 11];
+    for (dst, src) in out.iter_mut().zip(label.bytes()) {
+        *dst = src;
+    }
+    out
+}
+
+fn format_large_fat32_volume(letter: char, label: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        format_large_fat32_volume_windows(letter, label)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (letter, label);
+        Err("Large FAT32 format requires Windows".to_string())
+    }
+}
+
+#[cfg(windows)]
+fn format_large_fat32_volume_windows(letter: char, label: &str) -> Result<(), String> {
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+    use windows::Win32::System::IO::DeviceIoControl;
+    use windows::Win32::System::Ioctl::{FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME, FSCTL_UNLOCK_VOLUME};
+
+    let path = format!(r"\\.\{letter}:");
+    // Lock requires share read/write on the open handle.
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
+        .open(&path)
+        .map_err(|err| format!("open {path}: {err}"))?;
+
+    let handle = HANDLE(file.as_raw_handle());
+    unsafe {
+        DeviceIoControl(handle, FSCTL_LOCK_VOLUME, None, 0, None, 0, None, None)
+            .map_err(|err| format!("lock {path}: {err}"))?;
+        if let Err(err) =
+            DeviceIoControl(handle, FSCTL_DISMOUNT_VOLUME, None, 0, None, 0, None, None)
+        {
+            let _ = DeviceIoControl(handle, FSCTL_UNLOCK_VOLUME, None, 0, None, 0, None, None);
+            return Err(format!("dismount {path}: {err}"));
+        }
+    }
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|err| format!("seek {path}: {err}"))?;
+    let options = fatfs::FormatVolumeOptions::new()
+        .fat_type(fatfs::FatType::Fat32)
+        .volume_label(pad_fat_volume_label(label));
+    let format_result = fatfs::format_volume(&mut file, options)
+        .map_err(|err| format!("fatfs format {path}: {err}"));
+
+    unsafe {
+        let _ = DeviceIoControl(handle, FSCTL_UNLOCK_VOLUME, None, 0, None, 0, None, None);
+    }
+    format_result
 }
 
 fn same_identity(disk: &EnumeratedDisk, id: &DiskId) -> bool {
@@ -365,8 +431,16 @@ try {
 
 #[cfg(test)]
 mod tests {
-    use super::INVENTORY_SCRIPT;
+    use super::{pad_fat_volume_label, INVENTORY_SCRIPT};
     use std::fs;
+
+    #[test]
+    fn pad_fat_volume_label_truncates_and_pads() {
+        assert_eq!(pad_fat_volume_label(""), *b"           ");
+        assert_eq!(pad_fat_volume_label("STORE"), *b"STORE      ");
+        assert_eq!(pad_fat_volume_label("EXACTLYELEV"), *b"EXACTLYELEV");
+        assert_eq!(pad_fat_volume_label("TOOLONGVOLUME"), *b"TOOLONGVOLU");
+    }
 
     #[cfg(windows)]
     #[test]

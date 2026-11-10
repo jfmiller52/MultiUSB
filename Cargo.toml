@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 chrono = "0.4"
+fatfs = "0.3"
 futures = "0.3"
 gpui-kit = "0.9.1"
 rfd = "0.15"
@@ -16,6 +17,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
