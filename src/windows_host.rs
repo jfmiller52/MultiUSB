@@ -3,10 +3,33 @@ use crate::commands::{
 };
 use crate::disk_id::{DiskId, EnumeratedDisk};
 use crate::job::VolumeHost;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Windows console apps (powershell, diskpart, cmd) flash a window unless this is set.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+fn hidden_command(program: impl AsRef<OsStr>) -> Command {
+    let mut cmd = Command::new(program);
+    hide_console_window(&mut cmd);
+    cmd
+}
+
+fn hide_console_window(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
 
 /// Shared with the window so closing it waits out an in-flight `diskpart`
 /// and never starts another one.
@@ -96,7 +119,7 @@ impl VolumeHost for WindowsHost {
 
     fn run_command(&mut self, cmd: &ExternalCommand) -> Result<(), String> {
         self.stop_if_closed();
-        let mut child = Command::new(&cmd.program)
+        let mut child = hidden_command(&cmd.program)
             .args(&cmd.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -217,7 +240,7 @@ fn temp_file(kind: &str, ext: &str) -> PathBuf {
 
 /// Run one `diskpart /s` and wait until it exits. Never kills the child.
 fn run_diskpart_once(script: &Path) -> Result<(), ()> {
-    let mut child = Command::new("diskpart.exe")
+    let mut child = hidden_command("diskpart.exe")
         .arg("/s")
         .arg(script)
         .stdin(Stdio::null())
@@ -235,7 +258,7 @@ fn inventory_json() -> Result<String, String> {
     let script_path = temp_file("inventory", "ps1");
     let out_path = temp_file("inventory", "json");
     std::fs::write(&script_path, INVENTORY_SCRIPT).map_err(|err| err.to_string())?;
-    let output = Command::new("powershell.exe")
+    let output = hidden_command("powershell.exe")
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -339,7 +362,15 @@ try {
 mod tests {
     use super::INVENTORY_SCRIPT;
     use std::fs;
-    use std::process::Command;
+
+    #[cfg(windows)]
+    #[test]
+    fn hide_console_window_sets_create_no_window() {
+        let mut cmd = std::process::Command::new("powershell.exe");
+        super::hide_console_window(&mut cmd);
+        assert_eq!(super::CREATE_NO_WINDOW, 0x0800_0000);
+        assert_eq!(cmd.get_program(), "powershell.exe");
+    }
 
     #[test]
     fn failed_association_query_fails_inventory() {
@@ -369,7 +400,7 @@ function Get-CimAssociatedInstance {
         let out_path = dir.join("out.json");
         fs::write(&script_path, format!("{stub}\r\n{INVENTORY_SCRIPT}")).unwrap();
 
-        let output = Command::new("powershell.exe")
+        let output = super::hidden_command("powershell.exe")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
