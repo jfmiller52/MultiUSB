@@ -463,12 +463,8 @@ impl App {
             }
             JobEvent::Prepare(PrepareNotice::Finished { index }) => {
                 self.prepared_done = self.prepared_done.saturating_add(1);
-                let row_index = self.runs.get_mut(index).map(|run| {
+                if let Some(run) = self.runs.get_mut(index) {
                     run.fraction = 1.0;
-                    run.row_index
-                });
-                if let Some(row_index) = row_index {
-                    self.append_disk_log(row_index, "Prepared");
                 }
             }
             JobEvent::Aborted {
@@ -488,7 +484,7 @@ impl App {
             JobEvent::Prepared(results) => {
                 let mut slot = 0usize;
                 let source_bytes = self.source_bytes;
-                let mut failure_logs = Vec::new();
+                let mut prepare_logs = Vec::new();
                 for (index, result) in results.into_iter().enumerate() {
                     let Some(run) = self.runs.get_mut(index) else {
                         continue;
@@ -504,18 +500,19 @@ impl App {
                             } else {
                                 DriveStatus::Ready
                             };
+                            prepare_logs.push((run.row_index, "Prepared".to_string()));
                         }
                         Err(failure) => {
                             run.status = DriveStatus::Failed;
                             run.fraction = 1.0;
                             let reason = prepare_reason(&failure);
-                            failure_logs.push((run.row_index, reason.clone()));
+                            prepare_logs.push((run.row_index, reason.clone()));
                             run.prepare_failure = Some(reason);
                         }
                     }
                 }
-                for (row_index, reason) in failure_logs {
-                    self.append_disk_log(row_index, &reason);
+                for (row_index, line) in prepare_logs {
+                    self.append_disk_log(row_index, &line);
                 }
                 if self.runs.iter().any(|run| run.reached_copy) {
                     self.phase = Phase::Copying;

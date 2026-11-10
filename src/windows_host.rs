@@ -245,7 +245,7 @@ fn format_large_fat32_volume_windows(letter: char, label: &str) -> Result<(), St
 
     let path = format!(r"\\.\{letter}:");
     // Lock requires share read/write on the open handle.
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
@@ -294,16 +294,21 @@ fn format_large_fat32_volume_windows(letter: char, label: &str) -> Result<(), St
         }
     };
 
-    if let Err(err) = file.seek(SeekFrom::Start(0)) {
+    // fatfs issues many sub-sector writes; Windows volume handles reject those
+    // with ERROR_INVALID_PARAMETER (87) unless we coalesce to whole sectors.
+    let mut volume = crate::sector_io::SectorIo::new(file, 512);
+    if let Err(err) = volume.seek(SeekFrom::Start(0)) {
         unlock();
         return Err(format!("seek {path}: {err}"));
     }
     let options = fatfs::FormatVolumeOptions::new()
         .fat_type(fatfs::FatType::Fat32)
+        .bytes_per_sector(512)
         .total_sectors(total_sectors)
         .volume_label(pad_fat_volume_label(label));
-    let format_result = fatfs::format_volume(&mut file, options)
+    let format_result = fatfs::format_volume(&mut volume, options)
         .map_err(|err| format!("fatfs format {path}: {err}"));
+    let file = volume.into_inner();
     if format_result.is_ok() {
         if let Err(err) = file.sync_all() {
             unlock();

@@ -6,6 +6,7 @@ pub mod format_plan;
 pub mod log_file;
 mod long_path;
 pub mod session;
+mod sector_io;
 pub mod source;
 pub mod verify;
 pub mod job;
