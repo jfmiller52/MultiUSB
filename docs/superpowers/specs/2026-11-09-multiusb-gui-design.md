@@ -45,7 +45,7 @@ MultiUSB is a small Windows desktop app that does the same job with the choices 
 - The process must be elevated. `diskpart clean` fails otherwise.
 - UI toolkit is iced (current stable crate). The window stays responsive while format, copy, and verify run off the UI thread.
 - Workspace is `C:\MultiUSB`. This is a new Rust project.
-- Windows `diskpart` and `format` refuse FAT32 on a volume larger than 32 GB. Large FAT32 is a separate choice and always goes through `fat32format.exe`. That program is not in this repo. The app looks for it next to `MultiUSB.exe`. The batch file's copy lives at `C:\UKUT USB\fat32format.exe` and can be placed beside the app.
+- Windows `diskpart` and `format` refuse FAT32 on a volume larger than 32 GB. Large FAT32 is a separate choice and is formatted in-process with the MIT `fatfs` crate after diskpart creates and assigns the partition (see `docs/superpowers/specs/2026-11-10-built-in-large-fat32-design.md`).
 - The source tree beside the batch file is large (provisioning files, scripts, binaries). Copy progress has to be byte-based so a long copy does not look frozen.
 
 ## Approaches
@@ -112,7 +112,7 @@ Filesystem behavior:
 - **NTFS.** `format fs=ntfs` in the script above. Label limit 32 characters.
 - **exFAT.** `format fs=exfat` in the script above. Label limit 15 characters.
 - **FAT32.** `format fs=fat32` in the script above. Label limit 11 characters. If the disk is larger than 32 GB, do not call `diskpart`. Fail that disk and tell the user to choose Large FAT32. Other disks continue.
-- **Large FAT32.** Always, at any size: `format fs=ntfs quick` and `assign` in diskpart, then run `fat32format.exe <letter>:` with the affirmative answer piped in (the batch file uses `echo y`), then set the label with the `label` command. Label limit 11 characters. Look for `fat32format.exe` next to `MultiUSB.exe` only. If it is missing, fail that disk with a message that names the missing program. Other disks continue. Do not copy `fat32format.exe` into this repo.
+- **Large FAT32.** Always, at any size: diskpart cleans, converts, creates a primary partition, and assigns a letter with no `format` line; then MultiUSB locks the volume and formats it as FAT32 in-process via `fatfs`, including the 11-character volume label. Other disks continue on failure.
 
 Label text written into the diskpart script may contain only letters, digits, space, hyphen, and underscore. Reject anything else before the job starts. Show the character limit beside the field once a filesystem is selected, and refuse Start when the label is too long for that filesystem.
 
@@ -189,7 +189,7 @@ Use iced's default theme and a single window titled MultiUSB. Keep the layout on
 - No removable disks, after a successful scan.
 - Not elevated, when they press Start.
 - FAT32 chosen for a disk larger than 32 GB.
-- `fat32format.exe` missing for a Large FAT32 disk.
+- Large FAT32 in-process format failed (lock, dismount, or `fatfs`).
 - `Logs` could not be created in the current working directory.
 - Disk disappeared, changed identity, or is no longer removable.
 - System disk was selected. The run stops before any wipe.
@@ -212,8 +212,8 @@ Each of these names the disk when a disk is involved. A failure on one disk does
 
 Automated tests do not touch real disks and do not run `diskpart`.
 
-- Diskpart script text for NTFS+GPT, NTFS+MBR, exFAT, FAT32 at or under 32 GB, and the NTFS-then-handoff shape used before `fat32format.exe` for Large FAT32.
-- FAT32 on a disk larger than 32 GB is rejected before `diskpart`. Large FAT32 uses `fat32format.exe` at any size.
+- Diskpart script text for NTFS+GPT, NTFS+MBR, exFAT, FAT32 at or under 32 GB, and the assign-only script used for Large FAT32 before the in-process `fatfs` format.
+- FAT32 on a disk larger than 32 GB is rejected before `diskpart`. Large FAT32 uses built-in `fatfs` formatting at any size.
 - Label acceptance and rejection, including a quote, a newline, a 15-character label accepted for exFAT and rejected for FAT32, and a label that is legal for NTFS but too long for exFAT.
 - "Run another batch" keeps source folder, filesystem, partition style, and label, and clears the drive checks.
 - Copy of a tree with an empty directory, a nested file, and a junction or symlink that must not be followed.

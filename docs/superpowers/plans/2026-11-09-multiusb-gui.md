@@ -10,17 +10,19 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-09-multiusb-gui-design.md`
 
+> **Superseded for Large FAT32:** `docs/superpowers/plans/2026-11-10-built-in-large-fat32.md` replaces every `fat32format.exe` requirement below. Large FAT32 is built-in via `fatfs`.
+
 ## Global Constraints
 
 - Workspace is `C:\MultiUSB`. Implement on `main`. Do not create a feature branch, worktree, or pull request.
 - Windows only. Automated tests must not run `diskpart` and must not wipe a real disk.
 - UI toolkit is iced 0.14. One window titled `MultiUSB`. Default theme. One column. No menus.
-- Do not copy `fat32format.exe` into this repo. Look for it beside `MultiUSB.exe` only.
+- Large FAT32 no longer requires `fat32format.exe` (see 2026-11-10 built-in plan).
 - `src/copy.rs` and `src/verify.rs` must not call `diskpart` or import wipe, format-plan, host, or job modules.
 - Filesystem dropdown, partition dropdown, and volume label have no default. Label box starts empty. Empty label is valid.
 - Filesystem entries, in order: FAT32, NTFS, exFAT, Large FAT32. Partition entries, in order: MBR, GPT.
 - Label characters: letters, digits, space, hyphen, underscore. Limits: FAT32 11, Large FAT32 11, exFAT 15, NTFS 32.
-- FAT32 on a disk larger than 32 GiB (`32 * 1024 * 1024 * 1024` bytes) does not call `diskpart`. Large FAT32 uses `fat32format.exe` at every size.
+- FAT32 on a disk larger than 32 GiB (`32 * 1024 * 1024 * 1024` bytes) does not call `diskpart`. Large FAT32 uses built-in `fatfs` at every size.
 - Prepare disks one at a time. Copy every successfully prepared drive at the same time. No concurrency cap.
 - `diskpart` retries: 3 attempts, 3 seconds between tries. Copy retries: 3 attempts, 10 seconds between tries.
 - Verification compares file path and size only, case-insensitively. Cap named mismatches at 20.
