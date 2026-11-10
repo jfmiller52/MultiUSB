@@ -3,7 +3,7 @@ use crate::job::{
     CleanedDisk, CopyTarget, DriveOutcome, PrepareAll, PrepareFailure, PrepareNotice, VolumeHost,
     copy_and_verify_all, failure_text, prepare_all, system_disk_stop_message,
 };
-use crate::label::{Filesystem, PartitionStyle};
+use crate::label::{Filesystem, LabelError, PartitionStyle, validate_label};
 use crate::log_file::write_run_log;
 use crate::session::{
     BatchUi, DriveRow, confirmation_body, initial_form, overall_fraction, run_another_batch,
@@ -11,10 +11,21 @@ use crate::session::{
 };
 use crate::source::{EntryKind, SourceEntry, walk_source};
 use crate::windows_host::{CloseGate, WindowsHost, is_elevated, relaunch_elevated};
-use iced::widget::{
-    button, checkbox, column, pick_list, progress_bar, row, scrollable, text, text_input,
+use futures::StreamExt;
+use gpui_kit::component::alert::Alert;
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::form::{Field, Form};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::progress::Progress;
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, WindowExt};
+use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::{
+    AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
+    Render, SharedString, Styled as _, Subscription, Task, Window, div, px,
 };
-use iced::{Element, Event, Fill, Subscription, Task, event, window};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Once};
 
@@ -44,27 +55,8 @@ impl DriveStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FsLabel(Filesystem);
-
-impl std::fmt::Display for FsLabel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0.as_str())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PartLabel(PartitionStyle);
-
-impl std::fmt::Display for PartLabel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0.as_str())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Idle,
-    Confirm,
     Preparing,
     Copying,
     Done,
@@ -98,27 +90,8 @@ enum JobEvent {
     Crashed,
 }
 
-#[derive(Debug, Clone)]
-enum Message {
-    SourceEdited(String),
-    Browse,
-    Filesystem(Filesystem),
-    Partition(PartitionStyle),
-    LabelEdited(String),
-    Toggle { index: usize, checked: bool },
-    Refresh,
-    Start,
-    Confirm,
-    Dismiss,
-    Relaunch,
-    RunAnother,
-    CloseRequested,
-    Worker(JobEvent),
-}
-
 pub struct App {
     ui: BatchUi,
-    source_text: String,
     disks: Vec<EnumeratedDisk>,
     list_error: Option<String>,
     elevated: bool,
@@ -128,19 +101,134 @@ pub struct App {
     prepared_done: usize,
     source_bytes: u64,
     skipped_links: Vec<PathBuf>,
+    source: Entity<InputState>,
+    label: Entity<InputState>,
+    filesystem: Entity<SelectState<Vec<&'static str>>>,
+    partition: Entity<SelectState<Vec<&'static str>>>,
+    events: Arc<Mutex<futures::channel::mpsc::UnboundedSender<JobEvent>>>,
+    _listener: Task<()>,
+    _subscriptions: Vec<Subscription>,
 }
 
-pub fn run() -> iced::Result {
-    iced::application(App::boot, App::update, App::view)
-        .title("MultiUSB")
-        .subscription(App::subscription)
-        .exit_on_close_request(false)
-        .window_size(iced::Size::new(760.0, 900.0))
-        .run()
+pub fn run() {
+    gpui_kit::application()
+        .with_assets(gpui_kit::assets::Assets)
+        .run(|cx| {
+            gpui_kit::init(cx);
+            gpui_kit::open_window(
+                gpui_kit::WindowOptions {
+                    window_bounds: Some(gpui_kit::WindowBounds::centered(
+                        gpui_kit::size(px(760.), px(900.)),
+                        cx,
+                    )),
+                    window_min_size: Some(gpui_kit::size(px(560.), px(640.))),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                window.set_window_title("MultiUSB");
+                cx.new(|cx| App::new(window, cx))
+            })
+            .expect("failed to open window");
+        });
 }
 
 impl App {
-    fn boot() -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let source = cx.new(|cx| InputState::new(window, cx).placeholder("Source folder"));
+        let label = cx.new(|cx| InputState::new(window, cx).placeholder("Volume label"));
+        let filesystem = cx.new(|cx| {
+            SelectState::new(
+                Filesystem::ALL.map(|item| item.as_str()).to_vec(),
+                None,
+                window,
+                cx,
+            )
+        });
+        let partition = cx.new(|cx| {
+            SelectState::new(
+                PartitionStyle::ALL.map(|item| item.as_str()).to_vec(),
+                None,
+                window,
+                cx,
+            )
+        });
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let events = Arc::new(Mutex::new(tx));
+        let listener = cx.spawn(async move |this, cx| {
+            while let Some(event) = rx.next().await {
+                if this
+                    .update(cx, |this, cx| {
+                        this.on_worker(event);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let subscriptions = vec![
+            cx.subscribe_in(&source, window, |this, state, event, _, cx| {
+                if this.locked() || !matches!(event, InputEvent::Change) {
+                    return;
+                }
+                let value = state.read(cx).value().to_string();
+                this.ui.form.source = if value.is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(value))
+                };
+                cx.notify();
+            }),
+            cx.subscribe_in(&label, window, |this, state, event, _, cx| {
+                if this.locked() || !matches!(event, InputEvent::Change) {
+                    return;
+                }
+                this.ui.form.label = state.read(cx).value().to_string();
+                cx.notify();
+            }),
+            cx.subscribe_in(
+                &filesystem,
+                window,
+                |this, _state, event, _, cx| {
+                    if this.locked() {
+                        return;
+                    }
+                    let SelectEvent::Confirm(value) = event;
+                    this.ui.form.filesystem = value.as_deref().and_then(named_filesystem);
+                    cx.notify();
+                },
+            ),
+            cx.subscribe_in(
+                &partition,
+                window,
+                |this, _state, event, _, cx| {
+                    if this.locked() {
+                        return;
+                    }
+                    let SelectEvent::Confirm(value) = event;
+                    this.ui.form.partition = value.as_deref().and_then(named_partition);
+                    cx.notify();
+                },
+            ),
+        ];
+
+        let view = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |_window, cx| {
+            let mut close = true;
+            if let Some(view) = view.upgrade() {
+                view.update(cx, |this, _| {
+                    this.gate.request_and_wait_for_diskpart();
+                    close = this.phase != Phase::Copying;
+                });
+            }
+            if close {
+                std::process::exit(0);
+            }
+            false
+        });
+
         let mut app = Self {
             ui: BatchUi {
                 form: initial_form(),
@@ -148,7 +236,6 @@ impl App {
                 log: Vec::new(),
                 show_another: false,
             },
-            source_text: String::new(),
             disks: Vec::new(),
             list_error: None,
             elevated: is_elevated(),
@@ -158,6 +245,13 @@ impl App {
             prepared_done: 0,
             source_bytes: 0,
             skipped_links: Vec::new(),
+            source,
+            label,
+            filesystem,
+            partition,
+            events,
+            _listener: listener,
+            _subscriptions: subscriptions,
         };
         app.reload_disks();
         app
@@ -167,260 +261,12 @@ impl App {
         matches!(self.phase, Phase::Preparing | Phase::Copying)
     }
 
-    fn subscription(_app: &Self) -> Subscription<Message> {
-        event::listen_with(on_window_event)
-    }
-
-    fn update(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::SourceEdited(value) if !self.locked() => {
-                self.source_text = value;
-                self.ui.form.source = if self.source_text.is_empty() {
-                    None
-                } else {
-                    Some(PathBuf::from(&self.source_text))
-                };
-            }
-            Message::Browse if !self.locked() => {
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_title("Source folder")
-                    .pick_folder()
-                {
-                    self.source_text = path.display().to_string();
-                    self.ui.form.source = Some(path);
-                }
-            }
-            Message::Filesystem(filesystem) if !self.locked() => {
-                self.ui.form.filesystem = Some(filesystem);
-            }
-            Message::Partition(style) if !self.locked() => {
-                self.ui.form.partition = Some(style);
-            }
-            Message::LabelEdited(value) if !self.locked() => {
-                self.ui.form.label = value;
-            }
-            Message::Toggle { index, checked } if !self.locked() => {
-                if let Some(row) = self.ui.rows.get_mut(index) {
-                    row.checked = checked;
-                }
-            }
-            Message::Refresh if !self.locked() => {
-                self.runs.clear();
-                self.prepared_done = 0;
-                self.reload_disks();
-            }
-            Message::Start if !self.locked() => {
-                if self.elevated {
-                    let checked = self.ui.rows.iter().filter(|row| row.checked).count();
-                    if start_enabled(&self.ui.form, checked) {
-                        self.phase = Phase::Confirm;
-                    }
-                }
-            }
-            Message::Dismiss => {
-                if self.phase == Phase::Confirm {
-                    self.phase = Phase::Idle;
-                }
-            }
-            Message::Confirm if self.phase == Phase::Confirm && self.elevated => {
-                return self.begin_job();
-            }
-            Message::Relaunch => match std::env::current_exe() {
-                Ok(exe) => match relaunch_elevated(&exe) {
-                    Ok(()) => std::process::exit(0),
-                    Err(err) => {
-                        self.ui
-                            .log
-                            .push(format!("Could not relaunch elevated: {err}"));
-                    }
-                },
-                Err(err) => {
-                    self.ui
-                        .log
-                        .push(format!("Could not relaunch elevated: {err}"));
-                }
-            },
-            Message::RunAnother => {
-                run_another_batch(&mut self.ui);
-                self.phase = Phase::Idle;
-                self.runs.clear();
-                self.prepared_done = 0;
-                self.source_bytes = 0;
-                self.skipped_links.clear();
-                self.reload_disks();
-            }
-            Message::CloseRequested => {
-                self.gate.request_and_wait_for_diskpart();
-                // Copy threads notice the flag at the next file boundary.
-                if self.phase != Phase::Copying {
-                    std::process::exit(0);
-                }
-            }
-            Message::Worker(event) => self.on_worker(event),
-            _ => {}
+    fn can_start(&self) -> bool {
+        if self.locked() || !self.elevated {
+            return false;
         }
-        Task::none()
-    }
-
-    fn view(&self) -> Element<'_, Message> {
-        let mut children: Vec<Element<'_, Message>> = Vec::new();
-        if !self.elevated {
-            children.push(text("Administrator rights are required to wipe disks.").into());
-            children.push(
-                button("Relaunch as administrator")
-                    .on_press(Message::Relaunch)
-                    .into(),
-            );
-        }
-
-        let mut source_input = text_input("Source folder", &self.source_text).width(Fill);
-        if !self.locked() {
-            source_input = source_input.on_input(Message::SourceEdited);
-        }
-        let browse = if self.locked() {
-            button("Browse")
-        } else {
-            button("Browse").on_press(Message::Browse)
-        };
-        children.push(row![source_input, browse].spacing(8).into());
-
-        children.push(
-            pick_list(
-                Filesystem::ALL.map(FsLabel),
-                self.ui.form.filesystem.map(FsLabel),
-                |FsLabel(filesystem)| Message::Filesystem(filesystem),
-            )
-            .placeholder("Select filesystem")
-            .width(Fill)
-            .into(),
-        );
-        children.push(
-            pick_list(
-                PartitionStyle::ALL.map(PartLabel),
-                self.ui.form.partition.map(PartLabel),
-                |PartLabel(style)| Message::Partition(style),
-            )
-            .placeholder("Select partition type")
-            .width(Fill)
-            .into(),
-        );
-
-        let mut label_input = text_input("Volume label", &self.ui.form.label).width(Fill);
-        if !self.locked() {
-            label_input = label_input.on_input(Message::LabelEdited);
-        }
-        let mut label_row: Vec<Element<'_, Message>> = vec![label_input.into()];
-        if let Some(filesystem) = self.ui.form.filesystem {
-            label_row.push(text(format!("{} characters", filesystem.label_limit())).into());
-        }
-        children.push(row(label_row).spacing(8).into());
-
-        let refresh = if self.locked() {
-            button("Refresh")
-        } else {
-            button("Refresh").on_press(Message::Refresh)
-        };
-        children.push(row![text("Removable disks"), refresh].spacing(8).into());
-        if let Some(error) = &self.list_error {
-            children.push(text(error).into());
-        } else if self.disks.is_empty() {
-            children.push(text("No removable disks.").into());
-        }
-        for (index, row_state) in self.ui.rows.iter().enumerate() {
-            let mut toggle = checkbox(row_state.checked).label(&row_state.detail);
-            if !self.locked() {
-                toggle = toggle.on_toggle(move |checked| Message::Toggle { index, checked });
-            }
-            children.push(toggle.into());
-        }
-
-        let show_start = !self.locked() && self.phase != Phase::Confirm;
-        if show_start {
-            let checked = self.ui.rows.iter().filter(|row| row.checked).count();
-            let start = button("Start");
-            let start = if start_enabled(&self.ui.form, checked) {
-                start.on_press(Message::Start)
-            } else {
-                start
-            };
-            children.push(start.into());
-        }
-
-        if self.phase == Phase::Confirm {
-            children.push(text(confirmation_body(&self.ui.form, &self.ui.rows)).into());
-            children.push(
-                row![
-                    button("Confirm").on_press(Message::Confirm),
-                    button("Dismiss").on_press(Message::Dismiss),
-                ]
-                .spacing(8)
-                .into(),
-            );
-        }
-
-        for run in &self.runs {
-            let Some(disk) = self.disks.get(run.row_index) else {
-                continue;
-            };
-            children.push(
-                text(format!(
-                    "Disk {} ({}) — {}",
-                    disk.number,
-                    disk.model,
-                    run.status.label()
-                ))
-                .into(),
-            );
-            children.push(progress_bar(0.0..=1.0, run.fraction).into());
-        }
-
-        if self.phase == Phase::Preparing {
-            children.push(
-                text(format!(
-                    "{} of {} disks prepared",
-                    self.prepared_done,
-                    self.runs.len()
-                ))
-                .into(),
-            );
-        }
-        if matches!(self.phase, Phase::Copying | Phase::Done)
-            && self.runs.iter().any(|run| run.reached_copy)
-        {
-            let copied: Vec<u64> = self
-                .runs
-                .iter()
-                .filter(|run| run.reached_copy)
-                .map(|run| run.copied)
-                .collect();
-            let fraction = overall_fraction(&copied, self.source_bytes);
-            children.push(text("Overall").into());
-            children.push(progress_bar(0.0..=1.0, fraction).into());
-        }
-
-        if !self.ui.log.is_empty() {
-            let lines: Vec<Element<'_, Message>> =
-                self.ui.log.iter().map(|line| text(line).into()).collect();
-            children.push(
-                scrollable(column(lines).spacing(4))
-                    .height(200)
-                    .width(Fill)
-                    .into(),
-            );
-        }
-
-        if self.ui.show_another {
-            children.push(
-                button("Run another batch")
-                    .on_press(Message::RunAnother)
-                    .into(),
-            );
-        }
-
-        scrollable(column(children).spacing(10).padding(16).width(Fill))
-            .width(Fill)
-            .height(Fill)
-            .into()
+        let checked = self.ui.rows.iter().filter(|row| row.checked).count();
+        start_enabled(&self.ui.form, checked)
     }
 
     fn reload_disks(&mut self) {
@@ -443,20 +289,84 @@ impl App {
         }
     }
 
-    fn begin_job(&mut self) -> Task<Message> {
+    fn browse_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.locked() {
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Source folder")
+            .pick_folder()
+        else {
+            return;
+        };
+        let shown = path.display().to_string();
+        self.ui.form.source = Some(path);
+        self.source.update(cx, |state, cx| {
+            state.set_value(shown, window, cx);
+        });
+        cx.notify();
+    }
+
+    fn ask_to_wipe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_start() {
+            return;
+        }
+        let body = confirmation_body(&self.ui.form, &self.ui.rows);
+        let view = cx.entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            alert
+                .title("Wipe these disks?")
+                .description(body.clone())
+                .confirm()
+                .ok_text("Wipe disks")
+                .ok_variant(ButtonVariant::Danger)
+                .cancel_text("Cancel")
+                .on_ok(move |_, _, cx| {
+                    view.update(cx, |this, cx| this.begin_job(cx));
+                    true
+                })
+        });
+    }
+
+    fn relaunch(&mut self, cx: &mut Context<Self>) {
+        let message = match std::env::current_exe() {
+            Ok(exe) => match relaunch_elevated(&exe) {
+                Ok(()) => std::process::exit(0),
+                Err(err) => format!("Could not relaunch elevated: {err}"),
+            },
+            Err(err) => format!("Could not relaunch elevated: {err}"),
+        };
+        self.ui.log.push(message);
+        cx.notify();
+    }
+
+    fn run_another(&mut self, cx: &mut Context<Self>) {
+        run_another_batch(&mut self.ui);
+        self.phase = Phase::Idle;
+        self.runs.clear();
+        self.prepared_done = 0;
+        self.source_bytes = 0;
+        self.skipped_links.clear();
+        self.reload_disks();
+        cx.notify();
+    }
+
+    fn begin_job(&mut self, cx: &mut Context<Self>) {
         let checked = self.ui.rows.iter().filter(|row| row.checked).count();
-        if !start_enabled(&self.ui.form, checked) {
+        if !start_enabled(&self.ui.form, checked) || !self.elevated {
             self.phase = Phase::Idle;
-            return Task::none();
+            cx.notify();
+            return;
         }
         let Some(source) = self.ui.form.source.clone() else {
-            return Task::none();
+            return;
         };
         let Some(filesystem) = self.ui.form.filesystem else {
-            return Task::none();
+            return;
         };
         let Some(partition) = self.ui.form.partition else {
-            return Task::none();
+            return;
         };
         let walk = match walk_source(&source) {
             Ok(walk) => walk,
@@ -465,7 +375,8 @@ impl App {
                 self.ui
                     .log
                     .push(format!("Source folder could not be read: {err}"));
-                return Task::none();
+                cx.notify();
+                return;
             }
         };
         let mut selected = Vec::new();
@@ -490,7 +401,8 @@ impl App {
         }
         if selected.is_empty() {
             self.phase = Phase::Idle;
-            return Task::none();
+            cx.notify();
+            return;
         }
         self.source_bytes = walk.entries.iter().fold(0u64, |sum, entry| {
             sum + match entry.kind {
@@ -512,7 +424,9 @@ impl App {
             source,
             walk.entries,
             self.gate.clone(),
-        )
+            Arc::clone(&self.events),
+        );
+        cx.notify();
     }
 
     fn on_worker(&mut self, event: JobEvent) {
@@ -643,11 +557,255 @@ impl App {
     }
 }
 
-fn on_window_event(event: Event, _status: event::Status, _window: window::Id) -> Option<Message> {
-    match event {
-        Event::Window(window::Event::CloseRequested) => Some(Message::CloseRequested),
-        _ => None,
+impl Render for App {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let locked = self.locked();
+        let mut column = v_flex()
+            .size_full()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .p_4()
+            .gap_4();
+
+        if !self.elevated {
+            column = column
+                .child(Alert::warning(
+                    "elevation",
+                    "Administrator rights are required to wipe disks.",
+                ))
+                .child(
+                    Button::new("relaunch")
+                        .label("Relaunch as administrator")
+                        .on_click(cx.listener(|this, _, _, cx| this.relaunch(cx))),
+                );
+        }
+
+        let label_note = label_note(self.ui.form.filesystem, &self.ui.form.label);
+        let label_invalid = self.ui.form.filesystem.is_some_and(|filesystem| {
+            validate_label(filesystem, &self.ui.form.label).is_err()
+        });
+
+        let mut form = Form::new()
+            .child(
+                Field::new().label("Source folder").child(
+                    h_flex()
+                        .gap_2()
+                        .w_full()
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                Input::new(&self.source).disabled(locked),
+                            ),
+                        )
+                        .child(
+                            Button::new("browse")
+                                .label("Browse")
+                                .disabled(locked)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.browse_source(window, cx);
+                                })),
+                        ),
+                ),
+            )
+            .child(
+                Field::new().label("Filesystem").child(
+                    Select::new(&self.filesystem)
+                        .placeholder("Select filesystem")
+                        .accessibility_label("Filesystem")
+                        .disabled(locked),
+                ),
+            )
+            .child(
+                Field::new().label("Partition type").child(
+                    Select::new(&self.partition)
+                        .placeholder("Select partition type")
+                        .accessibility_label("Partition type")
+                        .disabled(locked),
+                ),
+            )
+            .child(
+                Field::new().label("Volume label").child(
+                    v_flex().gap_1().w_full().child(
+                        Input::new(&self.label).disabled(locked),
+                    ).child(
+                        div()
+                            .text_sm()
+                            .text_color(if label_invalid {
+                                cx.theme().danger
+                            } else {
+                                cx.theme().muted_foreground
+                            })
+                            .child(label_note),
+                    ),
+                ),
+            )
+            .child(
+                Field::new().label("Removable disks").child(self.disk_list(locked, cx)),
+            );
+
+        if !locked {
+            form = form.footer(
+                Button::new("start")
+                    .primary()
+                    .label("Start")
+                    .disabled(!self.can_start())
+                    .on_click(cx.listener(|this, _, window, cx| this.ask_to_wipe(window, cx))),
+            );
+        }
+        column = column.child(form);
+
+        if !self.runs.is_empty() {
+            column = column.child(self.progress_block(cx));
+        }
+        if !self.ui.log.is_empty() {
+            column = column.child(self.log_block());
+        }
+        if self.ui.show_another {
+            column = column.child(
+                Button::new("another-batch")
+                    .label("Run another batch")
+                    .on_click(cx.listener(|this, _, _, cx| this.run_another(cx))),
+            );
+        }
+        column
     }
+}
+
+impl App {
+    fn disk_list(&self, locked: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut list = v_flex()
+            .id("disk-list")
+            .w_full()
+            .max_h(px(240.))
+            .gap_2()
+            .overflow_y_scrollbar();
+        if let Some(error) = &self.list_error {
+            list = list.child(Alert::error("disk-list-error", error.clone()));
+        } else if self.ui.rows.is_empty() {
+            list = list.child(
+                div()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("No removable disks."),
+            );
+        }
+        for row in &self.ui.rows {
+            let key = row.key.clone();
+            list = list.child(
+                Checkbox::new(SharedString::from(format!("disk-{key}")))
+                    .label(row.detail.clone())
+                    .checked(row.checked)
+                    .disabled(locked)
+                    .on_change(cx.listener(move |this, checked, _, cx| {
+                        if this.locked() {
+                            return;
+                        }
+                        if let Some(row) = this.ui.rows.iter_mut().find(|row| row.key == key) {
+                            row.checked = *checked;
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        v_flex().gap_2().w_full().child(
+            Button::new("refresh")
+                .ghost()
+                .label("Refresh")
+                .disabled(locked)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if this.locked() {
+                        return;
+                    }
+                    this.runs.clear();
+                    this.prepared_done = 0;
+                    this.reload_disks();
+                    cx.notify();
+                })),
+        ).child(list)
+    }
+
+    fn progress_block(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut block = v_flex().gap_3().w_full();
+        for run in &self.runs {
+            let Some(disk) = self.disks.get(run.row_index) else {
+                continue;
+            };
+            let key = disk_key(disk);
+            let color = match run.status {
+                DriveStatus::Failed => cx.theme().danger,
+                DriveStatus::Passed => cx.theme().success,
+                _ => cx.theme().foreground,
+            };
+            block = block
+                .child(
+                    h_flex()
+                        .justify_between()
+                        .w_full()
+                        .child(format!("Disk {} ({})", disk.number, disk.model))
+                        .child(div().text_color(color).child(run.status.label())),
+                )
+                .child(
+                    Progress::new(SharedString::from(format!("progress-{key}")))
+                        .value(run.fraction * 100.0),
+                );
+        }
+        if self.phase == Phase::Preparing {
+            block = block.child(format!(
+                "{} of {} disks prepared",
+                self.prepared_done,
+                self.runs.len()
+            ));
+        }
+        if matches!(self.phase, Phase::Copying | Phase::Done)
+            && self.runs.iter().any(|run| run.reached_copy)
+        {
+            let copied: Vec<u64> = self
+                .runs
+                .iter()
+                .filter(|run| run.reached_copy)
+                .map(|run| run.copied)
+                .collect();
+            let fraction = overall_fraction(&copied, self.source_bytes);
+            block = block
+                .child("Overall")
+                .child(Progress::new("overall").value(fraction * 100.0));
+        }
+        block
+    }
+
+    fn log_block(&self) -> impl IntoElement {
+        v_flex()
+            .id("run-log")
+            .w_full()
+            .flex_1()
+            .min_h(px(120.))
+            .max_h(px(240.))
+            .gap_1()
+            .overflow_y_scrollbar()
+            .text_sm()
+            .children(self.ui.log.iter().cloned())
+    }
+}
+
+fn label_note(filesystem: Option<Filesystem>, label: &str) -> String {
+    let Some(filesystem) = filesystem else {
+        return String::new();
+    };
+    match validate_label(filesystem, label) {
+        Ok(()) => format!("{} characters", filesystem.label_limit()),
+        Err(LabelError::TooLong { limit, .. }) => format!("Use at most {limit} characters."),
+        Err(LabelError::Character { .. }) => {
+            "Use letters, digits, spaces, hyphens, and underscores.".to_string()
+        }
+    }
+}
+
+fn named_filesystem(name: &str) -> Option<Filesystem> {
+    Filesystem::ALL.into_iter().find(|item| item.as_str() == name)
+}
+
+fn named_partition(name: &str) -> Option<PartitionStyle> {
+    PartitionStyle::ALL
+        .into_iter()
+        .find(|item| item.as_str() == name)
 }
 
 fn spawn_job(
@@ -658,11 +816,8 @@ fn spawn_job(
     source: PathBuf,
     entries: Vec<SourceEntry>,
     gate: CloseGate,
-) -> Task<Message> {
-    let (tx, rx) = futures::channel::mpsc::unbounded();
-    let tx = Arc::new(Mutex::new(tx));
-    let tx_job = Arc::clone(&tx);
-    let gate_job = gate.clone();
+    tx: Arc<Mutex<futures::channel::mpsc::UnboundedSender<JobEvent>>>,
+) {
     std::thread::spawn(move || {
         install_close_panic_hook();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -673,18 +828,17 @@ fn spawn_job(
                 label,
                 source,
                 entries,
-                gate_job.clone(),
-                &tx_job,
+                gate.clone(),
+                &tx,
             );
         }));
-        if gate_job.is_requested() {
+        if gate.is_requested() {
             std::process::exit(0);
         }
         if result.is_err() {
-            send_event(&tx_job, JobEvent::Crashed);
+            send_event(&tx, JobEvent::Crashed);
         }
     });
-    Task::run(rx, Message::Worker)
 }
 
 fn run_batch(
@@ -742,8 +896,6 @@ fn run_batch(
                 let on_enter = move || stop_copy_if_closed(&gate_enter);
                 let gate_bytes = gate.clone();
                 let on_bytes = move |index, copied, total| {
-                    // The current file has finished. Unwind this drive before
-                    // the next file, and let the other drives do the same.
                     stop_copy_if_closed(&gate_bytes);
                     send_event(
                         tx,

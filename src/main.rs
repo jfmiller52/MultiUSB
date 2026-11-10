@@ -1,3 +1,3 @@
-fn main() -> iced::Result {
-    multiusb::app::run()
+fn main() {
+    multiusb::app::run();
 }
