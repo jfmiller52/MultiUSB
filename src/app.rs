@@ -603,8 +603,8 @@ impl Render for App {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .p_4()
-            .gap_3();
+            .p_3()
+            .gap_2();
 
         if !self.elevated {
             column = column
@@ -630,15 +630,18 @@ impl Render for App {
             .id("disk-log-split")
             .w_full()
             .flex_1()
-            .gap_3()
-            .min_h(px(280.))
+            .min_h(px(0.))
+            .gap_2()
+            .items_stretch()
             .child(
                 v_flex()
                     .id("disks-pane")
                     .flex_1()
                     .min_w_0()
+                    .min_h(px(0.))
+                    .h_full()
                     .gap_2()
-                    .p_3()
+                    .p_2()
                     .border_1()
                     .border_color(cx.theme().border)
                     .rounded(cx.theme().radius)
@@ -652,8 +655,10 @@ impl Render for App {
                     .w(px(280.))
                     .min_w(px(220.))
                     .max_w(px(340.))
+                    .min_h(px(0.))
+                    .h_full()
                     .gap_2()
-                    .p_3()
+                    .p_2()
                     .border_1()
                     .border_color(cx.theme().border)
                     .rounded(cx.theme().radius)
@@ -682,10 +687,11 @@ impl Render for App {
 
         let mut footer = h_flex()
             .w_full()
+            .flex_shrink_0()
             .justify_between()
             .items_center()
             .gap_3()
-            .pt_3()
+            .pt_2()
             .border_t_1()
             .border_color(cx.theme().border);
         footer = footer.child(
@@ -732,12 +738,12 @@ impl App {
         });
         let muted = cx.theme().muted_foreground;
 
-        h_flex()
+        let strip = h_flex()
             .id("settings-strip")
             .w_full()
             .gap_3()
             .items_end()
-            .p_3()
+            .p_2()
             .border_1()
             .border_color(cx.theme().border)
             .rounded(cx.theme().radius)
@@ -752,6 +758,7 @@ impl App {
                         h_flex()
                             .gap_2()
                             .w_full()
+                            .items_center()
                             .child(
                                 div().flex_1().min_w_0().child(
                                     Input::new(&self.source).disabled(locked),
@@ -796,18 +803,28 @@ impl App {
                     .w(px(150.))
                     .gap_1()
                     .child(div().text_sm().text_color(muted).child("Volume label"))
-                    .child(Input::new(&self.label).disabled(locked))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(if label_invalid {
-                                cx.theme().danger
-                            } else {
-                                muted
-                            })
-                            .child(label_note),
-                    ),
-            )
+                    .child(Input::new(&self.label).disabled(locked)),
+            );
+
+        if label_note.is_empty() {
+            strip.into_any_element()
+        } else {
+            v_flex()
+                .w_full()
+                .gap_1()
+                .child(strip)
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(if label_invalid {
+                            cx.theme().danger
+                        } else {
+                            muted
+                        })
+                        .child(label_note),
+                )
+                .into_any_element()
+        }
     }
 
     fn disk_list(&self, locked: bool, cx: &mut Context<Self>) -> impl IntoElement {
@@ -815,6 +832,7 @@ impl App {
             .id("disk-list")
             .w_full()
             .flex_1()
+            .min_h(px(0.))
             .gap_2()
             .overflow_y_scrollbar();
         if let Some(error) = &self.list_error {
@@ -867,12 +885,14 @@ impl App {
         }
         v_flex()
             .gap_2()
-            .w_full()
-            .flex_1()
+            .size_full()
+            .min_h(px(0.))
             .child(
                 h_flex()
                     .w_full()
+                    .flex_shrink_0()
                     .justify_between()
+                    .items_center()
                     .child("Removable disks")
                     .child(
                         Button::new("refresh")
