@@ -9,13 +9,24 @@ pub enum PreparePlan {
     LargeFat32 { script: String },
 }
 
-fn build_script(disk_number: u32, style: PartitionStyle, format_line: &str) -> String {
-    let convert = match style {
+fn convert_token(style: PartitionStyle) -> &'static str {
+    match style {
         PartitionStyle::Gpt => "gpt",
         PartitionStyle::Mbr => "mbr",
-    };
+    }
+}
+
+fn build_script(disk_number: u32, style: PartitionStyle, format_line: &str) -> String {
+    let convert = convert_token(style);
     format!(
         "rescan\r\nselect disk {disk_number}\r\nclean\r\nconvert {convert}\r\ncreate partition primary\r\n{format_line}\r\nassign\r\nexit\r\n"
+    )
+}
+
+fn build_assign_only_script(disk_number: u32, style: PartitionStyle) -> String {
+    let convert = convert_token(style);
+    format!(
+        "rescan\r\nselect disk {disk_number}\r\nclean\r\nconvert {convert}\r\ncreate partition primary\r\nassign\r\nexit\r\n"
     )
 }
 
@@ -30,8 +41,9 @@ pub fn prepare_plan(
         return PreparePlan::Fat32TooLarge;
     }
     if matches!(filesystem, Filesystem::LargeFat32) {
-        let script = build_script(disk_number, style, "format fs=ntfs quick");
-        return PreparePlan::LargeFat32 { script };
+        return PreparePlan::LargeFat32 {
+            script: build_assign_only_script(disk_number, style),
+        };
     }
     let format_line = format_line_for(filesystem, label);
     PreparePlan::Script(build_script(disk_number, style, &format_line))
@@ -55,6 +67,12 @@ mod tests {
     fn script(disk: u32, convert: &str, format_line: &str) -> String {
         format!(
             "rescan\r\nselect disk {disk}\r\nclean\r\nconvert {convert}\r\ncreate partition primary\r\n{format_line}\r\nassign\r\nexit\r\n"
+        )
+    }
+
+    fn assign_only_script(disk: u32, convert: &str) -> String {
+        format!(
+            "rescan\r\nselect disk {disk}\r\nclean\r\nconvert {convert}\r\ncreate partition primary\r\nassign\r\nexit\r\n"
         )
     }
 
@@ -92,13 +110,13 @@ mod tests {
         assert_eq!(
             prepare_plan(2, PartitionStyle::Mbr, Filesystem::LargeFat32, "LAB", limit + 1),
             PreparePlan::LargeFat32 {
-                script: script(2, "mbr", "format fs=ntfs quick")
+                script: assign_only_script(2, "mbr")
             }
         );
         assert_eq!(
             prepare_plan(2, PartitionStyle::Gpt, Filesystem::LargeFat32, "LAB", 1024),
             PreparePlan::LargeFat32 {
-                script: script(2, "gpt", "format fs=ntfs quick")
+                script: assign_only_script(2, "gpt")
             }
         );
     }
