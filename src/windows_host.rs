@@ -158,6 +158,11 @@ impl VolumeHost for WindowsHost {
         }
     }
 
+    fn format_large_fat32(&mut self, letter: char, label: &str) -> Result<(), String> {
+        let _ = (letter, label);
+        Err("Large FAT32 format is not implemented on this host".to_string())
+    }
+
     fn exe_path(&self) -> PathBuf {
         std::env::current_exe().unwrap_or_else(|_| PathBuf::from("MultiUSB.exe"))
     }

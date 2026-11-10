@@ -1,6 +1,4 @@
-use crate::commands::{
-    ExternalCommand, fat32format_beside_exe, fat32format_command, volume_label_command,
-};
+use crate::commands::ExternalCommand;
 use crate::copy::{COPY_RETRY, CopyError, copy_tree};
 use crate::disk_id::{DiskId, EnumeratedDisk, Gate, Rematch, gate, rematch};
 use crate::format_plan::{PreparePlan, prepare_plan};
@@ -14,13 +12,13 @@ pub trait VolumeHost {
     fn diskpart(&mut self, script: &str) -> Result<(), String>;
     fn letter_for(&mut self, id: &DiskId) -> Result<Option<char>, String>;
     fn run_command(&mut self, cmd: &ExternalCommand) -> Result<(), String>;
+    fn format_large_fat32(&mut self, letter: char, label: &str) -> Result<(), String>;
     fn exe_path(&self) -> PathBuf;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrepareFailure {
     Fat32TooLarge,
-    MissingFat32Format,
     Rematch(Rematch),
     Diskpart,
     NoLetter,
@@ -238,14 +236,7 @@ fn finish_large_fat32(
         Ok(letter) => letter,
         Err(failure) => return (Err(failure), cleaned),
     };
-    let exe = host.exe_path();
-    if !fat32format_beside_exe(&exe).exists() {
-        return (Err(PrepareFailure::MissingFat32Format), cleaned);
-    }
-    if let Err(message) = host.run_command(&fat32format_command(&exe, letter)) {
-        return (Err(PrepareFailure::Command(message)), cleaned);
-    }
-    if let Err(message) = host.run_command(&volume_label_command(letter, label)) {
+    if let Err(message) = host.format_large_fat32(letter, label) {
         return (Err(PrepareFailure::Command(message)), cleaned);
     }
     (Ok(prepared_disk(disk, letter)), cleaned)
@@ -366,7 +357,6 @@ fn verify_copied(target: &CopyTarget) -> DriveOutcome {
 pub fn failure_text(failure: &PrepareFailure) -> &'static str {
     match failure {
         PrepareFailure::Fat32TooLarge => "Choose Large FAT32. Disk is larger than 32 GB.",
-        PrepareFailure::MissingFat32Format => "fat32format.exe was not found beside MultiUSB.exe.",
         PrepareFailure::Rematch(Rematch::NotUnique | Rematch::Unique(_)) => {
             "Disk could not be matched uniquely."
         }
@@ -410,6 +400,8 @@ mod tests {
         letters: Vec<(String, Result<Option<char>, String>)>,
         commands: Vec<ExternalCommand>,
         command_error: Option<String>,
+        format_calls: Vec<(char, String)>,
+        format_error: Option<String>,
         exe: PathBuf,
         log: Arc<Mutex<Vec<Mark>>>,
     }
@@ -424,6 +416,8 @@ mod tests {
                 letters: Vec::new(),
                 commands: Vec::new(),
                 command_error: None,
+                format_calls: Vec::new(),
+                format_error: None,
                 exe: PathBuf::from(r"C:\MultiUSBTest\MultiUSB.exe"),
                 log: Arc::new(Mutex::new(Vec::new())),
             }
@@ -480,6 +474,14 @@ mod tests {
             }
         }
 
+        fn format_large_fat32(&mut self, letter: char, label: &str) -> Result<(), String> {
+            self.format_calls.push((letter, label.to_string()));
+            match &self.format_error {
+                Some(message) => Err(message.clone()),
+                None => Ok(()),
+            }
+        }
+
         fn exe_path(&self) -> PathBuf {
             self.exe.clone()
         }
@@ -519,6 +521,12 @@ mod tests {
     fn diskpart_script(number: u32, convert: &str, format_line: &str) -> String {
         format!(
             "rescan\r\nselect disk {number}\r\nclean\r\nconvert {convert}\r\ncreate partition primary\r\n{format_line}\r\nassign\r\nexit\r\n"
+        )
+    }
+
+    fn assign_only_script(number: u32, convert: &str) -> String {
+        format!(
+            "rescan\r\nselect disk {number}\r\nclean\r\nconvert {convert}\r\ncreate partition primary\r\nassign\r\nexit\r\n"
         )
     }
 
@@ -700,16 +708,10 @@ mod tests {
     }
 
     #[test]
-    fn large_fat32_runs_ntfs_handoff_then_fat32format_and_label() {
-        let root = scratch("fat32_tool");
-        let exe = root.join("MultiUSB.exe");
-        fs::write(&exe, b"app").unwrap();
-        fs::write(root.join("fat32format.exe"), b"tool").unwrap();
-
+    fn large_fat32_runs_assign_script_then_format_large_fat32() {
         let stick = removable(4, "Wide", "USB\\WIDE", 1024);
         let selected = ids(&[stick.clone()]);
         let mut host = FakeHost::new(vec![Ok(vec![stick])]);
-        host.exe = exe.clone();
         host.letter("USB\\WIDE", 'E');
         let mut on_prepare = notices(&host);
 
@@ -732,31 +734,18 @@ mod tests {
             },
             PrepareAll::AbortSystemDisk { .. } => panic!("expected the disk to finish"),
         }
-        assert_eq!(
-            host.scripts,
-            vec![diskpart_script(4, "mbr", "format fs=ntfs quick")]
-        );
-        assert_eq!(host.commands.len(), 2);
-        assert_eq!(host.commands[0].program, root.join("fat32format.exe"));
-        assert_eq!(host.commands[0].args, vec!["E:".to_string()]);
-        assert_eq!(host.commands[0].stdin, "y\r\n");
-        assert_eq!(host.commands[1].program, PathBuf::from("cmd.exe"));
-        assert_eq!(
-            host.commands[1].args,
-            vec!["/C".to_string(), "label E:STORE".to_string()]
-        );
-        assert_eq!(host.commands[1].stdin, "");
-        let _ = fs::remove_dir_all(&root);
+        assert_eq!(host.scripts, vec![assign_only_script(4, "mbr")]);
+        assert_eq!(host.format_calls, vec![('E', "STORE".to_string())]);
+        assert!(host.commands.is_empty());
     }
 
     #[test]
-    fn large_fat32_missing_sibling_fails_after_the_handoff_script() {
-        let root = scratch("fat32_missing");
+    fn large_fat32_format_error_is_command_failure() {
         let stick = removable(4, "Wide", "USB\\WIDE", FAT32_MAX_INCLUSIVE_BYTES + 1);
         let selected = ids(&[stick.clone()]);
         let mut host = FakeHost::new(vec![Ok(vec![stick])]);
-        host.exe = root.join("MultiUSB.exe");
         host.letter("USB\\WIDE", 'E');
+        host.format_error = Some("lock failed".to_string());
         let mut on_prepare = notices(&host);
 
         let result = prepare_all(
@@ -769,20 +758,41 @@ mod tests {
         );
 
         match result {
+            PrepareAll::Done(results) => match &results[0] {
+                Err(PrepareFailure::Command(message)) => assert_eq!(message, "lock failed"),
+                other => panic!("expected command failure, got {other:?}"),
+            },
+            PrepareAll::AbortSystemDisk { .. } => panic!("expected the disk to finish"),
+        }
+        assert_eq!(host.scripts, vec![assign_only_script(4, "gpt")]);
+        assert_eq!(host.format_calls, vec![('E', "STORE".to_string())]);
+        assert!(host.commands.is_empty());
+    }
+
+    #[test]
+    fn other_filesystems_do_not_call_format_large_fat32() {
+        let stick = removable(2, "Stick", "USB\\A", 100);
+        let selected = ids(&[stick.clone()]);
+        let mut host = FakeHost::new(vec![Ok(vec![stick])]);
+        host.letter("USB\\A", 'F');
+        let mut on_prepare = notices(&host);
+
+        let result = prepare_all(
+            &selected,
+            Filesystem::Ntfs,
+            PartitionStyle::Gpt,
+            "STORE",
+            &mut host,
+            &mut on_prepare,
+        );
+
+        match result {
             PrepareAll::Done(results) => {
-                assert!(matches!(
-                    results[0],
-                    Err(PrepareFailure::MissingFat32Format)
-                ));
+                assert!(matches!(results[0], Ok(ref prepared) if prepared.letter == 'F'));
             }
             PrepareAll::AbortSystemDisk { .. } => panic!("expected the disk to finish"),
         }
-        assert_eq!(
-            host.scripts,
-            vec![diskpart_script(4, "gpt", "format fs=ntfs quick")]
-        );
-        assert!(host.commands.is_empty());
-        let _ = fs::remove_dir_all(&root);
+        assert!(host.format_calls.is_empty());
     }
 
     #[test]
@@ -1003,12 +1013,10 @@ mod tests {
     }
 
     #[test]
-    fn missing_letter_wins_over_missing_fat32format() {
-        let root = scratch("letter_before_tool");
+    fn missing_letter_skips_format_large_fat32() {
         let stick = removable(4, "Wide", "USB\\WIDE", 1024);
         let selected = ids(&[stick.clone()]);
         let mut host = FakeHost::new(vec![Ok(vec![stick])]);
-        host.exe = root.join("MultiUSB.exe");
         let mut on_prepare = notices(&host);
 
         let result = prepare_all(
@@ -1026,44 +1034,9 @@ mod tests {
             }
             PrepareAll::AbortSystemDisk { .. } => panic!("expected the disk to finish"),
         }
-        assert_eq!(host.scripts.len(), 1);
+        assert_eq!(host.scripts, vec![assign_only_script(4, "gpt")]);
+        assert!(host.format_calls.is_empty());
         assert!(host.commands.is_empty());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn command_error_is_the_disk_reason_and_skips_the_label() {
-        let root = scratch("cmd_err");
-        fs::write(root.join("fat32format.exe"), b"tool").unwrap();
-        let stick = removable(4, "Wide", "USB\\WIDE", 1024);
-        let selected = ids(&[stick.clone()]);
-        let mut host = FakeHost::new(vec![Ok(vec![stick])]);
-        host.exe = root.join("MultiUSB.exe");
-        host.letter("USB\\WIDE", 'E');
-        host.command_error = Some("fat32format failed".to_string());
-        let mut on_prepare = notices(&host);
-
-        let result = prepare_all(
-            &selected,
-            Filesystem::LargeFat32,
-            PartitionStyle::Gpt,
-            "STORE",
-            &mut host,
-            &mut on_prepare,
-        );
-
-        match result {
-            PrepareAll::Done(results) => match &results[0] {
-                Err(PrepareFailure::Command(message)) => {
-                    assert_eq!(message, "fat32format failed");
-                }
-                other => panic!("expected command failure, got {other:?}"),
-            },
-            PrepareAll::AbortSystemDisk { .. } => panic!("expected the disk to finish"),
-        }
-        assert_eq!(host.commands.len(), 1);
-        assert_eq!(host.commands[0].args, vec!["E:".to_string()]);
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1175,10 +1148,6 @@ mod tests {
         assert_eq!(
             failure_text(&PrepareFailure::Fat32TooLarge),
             "Choose Large FAT32. Disk is larger than 32 GB."
-        );
-        assert_eq!(
-            failure_text(&PrepareFailure::MissingFat32Format),
-            "fat32format.exe was not found beside MultiUSB.exe."
         );
         assert_eq!(
             failure_text(&PrepareFailure::Rematch(Rematch::NotUnique)),

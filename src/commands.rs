@@ -1,6 +1,6 @@
 use crate::disk_id::{DiskId, EnumeratedDisk};
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 pub struct ExternalCommand {
@@ -27,19 +27,6 @@ pub fn run_with_retries(
         }
     }
     Err(())
-}
-
-pub fn fat32format_beside_exe(exe: &Path) -> PathBuf {
-    let parent = exe.parent().expect("executable path has a parent directory");
-    parent.join("fat32format.exe")
-}
-
-pub fn fat32format_command(exe: &Path, letter: char) -> ExternalCommand {
-    ExternalCommand {
-        program: fat32format_beside_exe(exe),
-        args: vec![format!("{letter}:")],
-        stdin: "y\r\n".to_string(),
-    }
 }
 
 pub fn volume_label_command(letter: char, label: &str) -> ExternalCommand {
@@ -166,23 +153,6 @@ mod tests {
         let mut op = || Err(());
         let result = run_with_retries(3, DISKPART_WAIT, &sleep, &mut op);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn fat32format_beside_exe_path() {
-        assert_eq!(
-            fat32format_beside_exe(Path::new(r"C:\App\MultiUSB.exe")),
-            PathBuf::from(r"C:\App\fat32format.exe")
-        );
-    }
-
-    #[test]
-    fn fat32format_command_spec() {
-        let exe = Path::new(r"C:\App\MultiUSB.exe");
-        let cmd = fat32format_command(exe, 'E');
-        assert_eq!(cmd.program, PathBuf::from(r"C:\App\fat32format.exe"));
-        assert_eq!(cmd.args, vec!["E:".to_string()]);
-        assert_eq!(cmd.stdin, "y\r\n");
     }
 
     #[test]
