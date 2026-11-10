@@ -6,8 +6,9 @@ use crate::job::{
 use crate::label::{Filesystem, LabelError, PartitionStyle, validate_label};
 use crate::log_file::write_run_log;
 use crate::session::{
-    BatchUi, DriveRow, confirmation_body, disk_log_name, format_drive_detail, format_drive_result,
-    initial_form, overall_fraction, run_another_batch, start_enabled,
+    BatchUi, DriveRow, batch_total_fraction_copy, batch_total_fraction_prep, confirmation_body,
+    disk_log_name, format_drive_detail, format_drive_result, initial_form, run_another_batch,
+    start_enabled,
 };
 use crate::source::{EntryKind, SourceEntry, walk_source};
 use crate::windows_host::{CloseGate, WindowsHost, is_elevated, relaunch_elevated};
@@ -597,7 +598,7 @@ impl Render for App {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .p_4()
-            .gap_4();
+            .gap_3();
 
         if !self.elevated {
             column = column
@@ -612,12 +613,67 @@ impl Render for App {
                 );
         }
 
+        column = column.child(self.settings_strip(locked, cx));
+
+        if !self.runs.is_empty() {
+            column = column.child(self.total_progress_block());
+        }
+
+        column = column.child(
+            h_flex()
+                .id("disk-log-split")
+                .w_full()
+                .flex_1()
+                .gap_3()
+                .min_h(px(280.))
+                .child(
+                    v_flex()
+                        .id("disks-pane")
+                        .flex_1()
+                        .min_w_0()
+                        .gap_2()
+                        .child(self.disk_list(locked, cx)),
+                )
+                .child(
+                    v_flex()
+                        .id("log-pane")
+                        .flex_1()
+                        .min_w_0()
+                        .gap_2()
+                        .child(self.log_block(cx)),
+                ),
+        );
+
+        let mut footer = h_flex().w_full().justify_between().gap_2();
+        if !locked {
+            footer = footer.child(
+                Button::new("start")
+                    .primary()
+                    .label("Start")
+                    .disabled(!self.can_start())
+                    .on_click(cx.listener(|this, _, window, cx| this.ask_to_wipe(window, cx))),
+            );
+        } else {
+            footer = footer.child(div());
+        }
+        if self.ui.show_another {
+            footer = footer.child(
+                Button::new("another-batch")
+                    .label("Run another batch")
+                    .on_click(cx.listener(|this, _, _, cx| this.run_another(cx))),
+            );
+        }
+        column.child(footer)
+    }
+}
+
+impl App {
+    fn settings_strip(&self, locked: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let label_note = label_note(self.ui.form.filesystem, &self.ui.form.label);
         let label_invalid = self.ui.form.filesystem.is_some_and(|filesystem| {
             validate_label(filesystem, &self.ui.form.label).is_err()
         });
-
-        let mut form = Form::new()
+        Form::new()
             .child(
                 Field::new().label("Source folder").child(
                     h_flex()
@@ -670,44 +726,13 @@ impl Render for App {
                     ),
                 ),
             )
-            .child(
-                Field::new().label("Removable disks").child(self.disk_list(locked, cx)),
-            );
-
-        if !locked {
-            form = form.footer(
-                Button::new("start")
-                    .primary()
-                    .label("Start")
-                    .disabled(!self.can_start())
-                    .on_click(cx.listener(|this, _, window, cx| this.ask_to_wipe(window, cx))),
-            );
-        }
-        column = column.child(form);
-
-        if !self.runs.is_empty() {
-            column = column.child(self.progress_block(cx));
-        }
-        if !self.ui.log.is_empty() {
-            column = column.child(self.log_block());
-        }
-        if self.ui.show_another {
-            column = column.child(
-                Button::new("another-batch")
-                    .label("Run another batch")
-                    .on_click(cx.listener(|this, _, _, cx| this.run_another(cx))),
-            );
-        }
-        column
     }
-}
 
-impl App {
     fn disk_list(&self, locked: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let mut list = v_flex()
             .id("disk-list")
             .w_full()
-            .max_h(px(240.))
+            .flex_1()
             .gap_2()
             .overflow_y_scrollbar();
         if let Some(error) = &self.list_error {
@@ -719,9 +744,11 @@ impl App {
                     .child("No removable disks."),
             );
         }
-        for row in &self.ui.rows {
+        for (row_index, row) in self.ui.rows.iter().enumerate() {
             let key = row.key.clone();
-            list = list.child(
+            let progress_key = key.clone();
+            let run = self.runs.iter().find(|run| run.row_index == row_index);
+            let mut card = v_flex().gap_1().w_full().child(
                 Checkbox::new(SharedString::from(format!("disk-{key}")))
                     .label(row.detail.clone())
                     .checked(row.checked)
@@ -736,84 +763,120 @@ impl App {
                         cx.notify();
                     })),
             );
+            if let Some(run) = run {
+                let color = match run.status {
+                    DriveStatus::Failed => cx.theme().danger,
+                    DriveStatus::Passed => cx.theme().success,
+                    _ => cx.theme().muted_foreground,
+                };
+                card = card
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(color)
+                            .child(run.status.label()),
+                    )
+                    .child(
+                        Progress::new(SharedString::from(format!("progress-{progress_key}")))
+                            .value(run.fraction * 100.0),
+                    );
+            }
+            list = list.child(card);
         }
-        v_flex().gap_2().w_full().child(
-            Button::new("refresh")
-                .ghost()
-                .label("Refresh")
-                .disabled(locked)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if this.locked() {
-                        return;
-                    }
-                    this.runs.clear();
-                    this.prepared_done = 0;
-                    this.reload_disks();
-                    cx.notify();
-                })),
-        ).child(list)
+        v_flex()
+            .gap_2()
+            .w_full()
+            .flex_1()
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .child("Removable disks")
+                    .child(
+                        Button::new("refresh")
+                            .ghost()
+                            .label("Refresh")
+                            .disabled(locked)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.locked() {
+                                    return;
+                                }
+                                this.runs.clear();
+                                this.prepared_done = 0;
+                                this.reload_disks();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(list)
     }
 
-    fn progress_block(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut block = v_flex().gap_3().w_full();
-        for run in &self.runs {
-            let Some(disk) = self.disks.get(run.row_index) else {
-                continue;
-            };
-            let key = disk_key(disk);
-            let color = match run.status {
-                DriveStatus::Failed => cx.theme().danger,
-                DriveStatus::Passed => cx.theme().success,
-                _ => cx.theme().foreground,
-            };
-            block = block
-                .child(
-                    h_flex()
-                        .justify_between()
-                        .w_full()
-                        .child(format!("Disk {} ({})", disk.number, disk.model))
-                        .child(div().text_color(color).child(run.status.label())),
-                )
-                .child(
-                    Progress::new(SharedString::from(format!("progress-{key}")))
-                        .value(run.fraction * 100.0),
-                );
-        }
+    fn total_progress_fraction(&self) -> f32 {
         if self.phase == Phase::Preparing {
-            block = block.child(format!(
-                "{} of {} disks prepared",
-                self.prepared_done,
-                self.runs.len()
-            ));
-        }
-        if matches!(self.phase, Phase::Copying | Phase::Done)
-            && self.runs.iter().any(|run| run.reached_copy)
-        {
+            batch_total_fraction_prep(self.prepared_done, self.runs.len())
+        } else {
             let copied: Vec<u64> = self
                 .runs
                 .iter()
                 .filter(|run| run.reached_copy)
                 .map(|run| run.copied)
                 .collect();
-            let fraction = overall_fraction(&copied, self.source_bytes);
-            block = block
-                .child("Overall")
-                .child(Progress::new("overall").value(fraction * 100.0));
+            batch_total_fraction_copy(&copied, self.source_bytes)
         }
-        block
     }
 
-    fn log_block(&self) -> impl IntoElement {
+    fn total_progress_block(&self) -> impl IntoElement {
+        let fraction = self.total_progress_fraction();
+        let caption = if self.phase == Phase::Preparing {
+            format!(
+                "{} of {} disks prepared",
+                self.prepared_done,
+                self.runs.len()
+            )
+        } else {
+            "Total progress".to_string()
+        };
         v_flex()
+            .gap_2()
+            .w_full()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .w_full()
+                    .child(caption)
+                    .child(format!("{:.0}%", fraction * 100.0)),
+            )
+            .child(Progress::new("overall").value(fraction * 100.0))
+    }
+
+    fn log_block(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let show_placeholder = self.ui.log.is_empty() && self.phase != Phase::Idle;
+        let mut body = v_flex()
             .id("run-log")
             .w_full()
             .flex_1()
-            .min_h(px(120.))
-            .max_h(px(240.))
             .gap_1()
             .overflow_y_scrollbar()
-            .text_sm()
-            .children(self.ui.log.iter().cloned())
+            .text_sm();
+        if self.ui.log.is_empty() {
+            body = body.child(
+                div()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if show_placeholder {
+                        "Waiting for activity…"
+                    } else {
+                        "Live log"
+                    }),
+            );
+        } else {
+            body = body.children(self.ui.log.iter().cloned());
+        }
+        v_flex()
+            .gap_2()
+            .w_full()
+            .flex_1()
+            .child("Live log")
+            .child(body)
     }
 }
 

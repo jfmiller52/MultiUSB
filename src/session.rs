@@ -130,6 +130,17 @@ pub fn format_drive_result(
     format!("{}: {status}", disk_log_name(number, model, serial))
 }
 
+pub fn batch_total_fraction_prep(prepared_done: usize, run_count: usize) -> f32 {
+    if run_count == 0 {
+        return 0.0;
+    }
+    prepared_done as f32 / run_count as f32
+}
+
+pub fn batch_total_fraction_copy(bytes_copied: &[u64], source_bytes: u64) -> f32 {
+    overall_fraction(bytes_copied, source_bytes)
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -295,5 +306,13 @@ mod tests {
             format_drive_result(2, "Kingston", None, "Failed"),
             "Disk 2 (Kingston) · S/N unavailable: Failed"
         );
+    }
+
+    #[test]
+    fn batch_total_fraction_uses_prep_ratio_then_bytes() {
+        assert!((batch_total_fraction_prep(1, 4) - 0.25).abs() < f32::EPSILON);
+        assert_eq!(batch_total_fraction_prep(0, 0), 0.0);
+        let bytes = batch_total_fraction_copy(&[600, 400], 1000);
+        assert!((bytes - 0.5).abs() < 0.001);
     }
 }
