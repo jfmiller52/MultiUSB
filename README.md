@@ -20,7 +20,7 @@
 
 **MultiUSB** is a Windows desktop app for technicians who need the same folder on a pile of USB sticks — without accidentally redecorating the system drive.
 
-You pick a source folder, a filesystem, a partition style, a label, and the removable disks you actually meant to nuke. MultiUSB wipes those disks with `diskpart`, formats them (including **Large FAT32** built-in — no sidecar `.exe` haunted attic), copies the folder onto every prepared stick **at the same time**, then verifies every file’s path and size. One stick fails? The others keep going. Your blood pressure stays mostly theoretical.
+You pick a source folder, a filesystem, a partition style, a label, and the removable disks you actually meant to nuke. MultiUSB wipes those disks with `diskpart`, formats them (FAT32 auto-picks diskpart or built-in `fatfs` when the stick is over 32 GiB — no sidecar `.exe` haunted attic), copies the folder onto every prepared stick **at the same time**, then verifies every file’s path and size. One stick fails? The others keep going. Your blood pressure stays mostly theoretical.
 
 ## Features
 
@@ -28,7 +28,7 @@ You pick a source folder, a filesystem, a partition style, a label, and the remo
 |--------|------------------|
 | **Disk-first UI** | Settings strip up top, removable disks as the main stage, live log beside them |
 | **Per-disk + batch progress** | Watch each stick crawl toward glory (or doom) |
-| **FAT32 / NTFS / exFAT / Large FAT32** | Including >32 GB FAT32 without `fat32format.exe` |
+| **FAT32 / NTFS / exFAT** | FAT32 >32 GiB uses built-in `fatfs` — no `fat32format.exe` |
 | **MBR or GPT** | Because some firmware still lives in 2009 |
 | **Concurrent copy** | Sticks don’t take turns like polite dinner guests |
 | **Path + size verify** | “Robocopy exit code 7” is not a verification strategy |
@@ -43,7 +43,7 @@ flowchart LR
   A[Pick source + FS + style + label] --> B[Check removable disks]
   B --> C[Confirm wipe list]
   C --> D[diskpart clean / partition / assign]
-  D --> E{Large FAT32?}
+  D --> E{FAT32 and >32 GiB?}
   E -->|yes| F[Built-in fatfs format]
   E -->|no| G[diskpart quick format]
   F --> H[Copy all sticks in parallel]
@@ -82,8 +82,7 @@ cargo test
 
 | Choice | Label limit | Notes |
 |--------|-------------|--------|
-| **FAT32** | 11 | Rejected if the disk is larger than 32 GiB — choose Large FAT32 instead |
-| **Large FAT32** | 11 | Any size: assign-only `diskpart`, then in-process MIT [`fatfs`](https://crates.io/crates/fatfs) format |
+| **FAT32** | 11 | ≤32 GiB: `diskpart` quick format. Larger: assign-only `diskpart`, then in-process MIT [`fatfs`](https://crates.io/crates/fatfs) |
 | **exFAT** | 15 | Big files, fewer existential crises |
 | **NTFS** | 32 | When the stick needs to grow up |
 
@@ -102,14 +101,14 @@ MultiUSB/
 │   ├── commands.rs         # Retries, inventory JSON parsing
 │   ├── copy.rs             # Concurrent tree copy (no robocopy)
 │   ├── disk_id.rs          # Removable identity, rematch, system-disk gate
-│   ├── format_plan.rs      # diskpart scripts + Large FAT32 assign-only path
+│   ├── format_plan.rs      # diskpart scripts + auto FAT32 size routing
 │   ├── job.rs              # Prepare → copy → verify orchestration
 │   ├── label.rs            # Filesystem / partition enums + label rules
 │   ├── log_file.rs         # Run logs under Logs/
 │   ├── session.rs          # UI models, progress, serial naming
 │   ├── source.rs           # Source walk (no junction/symlink escape)
 │   ├── verify.rs           # Path + size verification
-│   ├── windows_host.rs     # WMI, diskpart, elevation, built-in Large FAT32
+│   ├── windows_host.rs     # WMI, diskpart, elevation, built-in FAT32 >32 GiB
 │   ├── lib.rs
 │   └── main.rs             # windows_subsystem = "windows"
 ├── Cargo.lock
@@ -123,7 +122,7 @@ MultiUSB/
 |----------|-------------|
 | [GUI design](docs/superpowers/specs/2026-11-09-multiusb-gui-design.md) | Goals, wipe/copy/verify behavior, safety rules |
 | [Disk-first layout](docs/superpowers/specs/2026-11-10-disk-first-layout-design.md) | Settings strip, dual progress, live log, serials |
-| [Built-in Large FAT32](docs/superpowers/specs/2026-11-10-built-in-large-fat32-design.md) | Why `fat32format.exe` got fired |
+| [Built-in FAT32 >32 GiB](docs/superpowers/specs/2026-11-10-built-in-large-fat32-design.md) | Why `fat32format.exe` got fired |
 | [Releases](https://github.com/jfmiller52/MultiUSB/releases) | Prebuilt `.exe` downloads |
 
 ## Safety (the boring part that saves careers)

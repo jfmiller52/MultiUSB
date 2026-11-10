@@ -119,9 +119,101 @@ impl<T: Seek> Seek for SectorIo<T> {
     }
 }
 
+/// Views a byte range of a larger block device as a standalone volume.
+///
+/// Used so FAT32 can be written through `\\.\PhysicalDriveN` at the partition
+/// starting offset while the volume letter stays locked/dismounted.
+pub struct PartitionView<T> {
+    inner: T,
+    base: u64,
+    length: u64,
+    pos: u64,
+}
+
+impl<T> PartitionView<T> {
+    pub fn new(inner: T, base: u64, length: u64) -> Self {
+        Self {
+            inner,
+            base,
+            length,
+            pos: 0,
+        }
+    }
+
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+
+    fn absolute(&self, relative: u64) -> io::Result<u64> {
+        let abs = self
+            .base
+            .checked_add(relative)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "partition offset overflow"))?;
+        Ok(abs)
+    }
+}
+
+impl<T: Read + Seek> Read for PartitionView<T> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() || self.pos >= self.length {
+            return Ok(0);
+        }
+        let remaining = (self.length - self.pos) as usize;
+        let take = min(buf.len(), remaining);
+        let abs = self.absolute(self.pos)?;
+        self.inner.seek(SeekFrom::Start(abs))?;
+        let n = self.inner.read(&mut buf[..take])?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl<T: Write + Seek> Write for PartitionView<T> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        if self.pos >= self.length {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "write past end of partition",
+            ));
+        }
+        let remaining = (self.length - self.pos) as usize;
+        let take = min(data.len(), remaining);
+        let abs = self.absolute(self.pos)?;
+        self.inner.seek(SeekFrom::Start(abs))?;
+        let n = self.inner.write(&data[..take])?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<T: Seek> Seek for PartitionView<T> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new_pos = match pos {
+            SeekFrom::Start(n) => n as i64,
+            SeekFrom::End(n) => self.length as i64 + n,
+            SeekFrom::Current(n) => self.pos as i64 + n,
+        };
+        if new_pos < 0 || new_pos as u64 > self.length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek outside partition",
+            ));
+        }
+        self.pos = new_pos as u64;
+        Ok(self.pos)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::SectorIo;
+    use super::{PartitionView, SectorIo};
     use std::io::{Read, Seek, SeekFrom, Write};
 
     /// Backend that rejects any I/O that is not a full sector at a sector boundary.
@@ -291,5 +383,108 @@ mod tests {
         // fatfs default OEM name is MSWIN4.1
         assert_eq!(&strict.data[3..11], b"MSWIN4.1");
         assert_eq!(&strict.data[71..82], b"MCD-NSO-USB");
+    }
+
+    #[test]
+    fn partition_view_maps_relative_io_to_base_offset() {
+        let mut disk = vec![0u8; 4096];
+        {
+            let mut view = PartitionView::new(std::io::Cursor::new(&mut disk[..]), 1024, 512);
+            view.write_all(&[1, 2, 3, 4]).unwrap();
+            view.seek(SeekFrom::Start(0)).unwrap();
+            let mut buf = [0u8; 4];
+            view.read_exact(&mut buf).unwrap();
+            assert_eq!(buf, [1, 2, 3, 4]);
+        }
+        assert_eq!(&disk[1024..1028], &[1, 2, 3, 4]);
+        assert_eq!(disk[0], 0);
+    }
+
+    #[test]
+    fn fatfs_format_through_partition_view_and_sector_io() {
+        let partition_size = 64 * 1024 * 1024usize;
+        let base = 1024usize;
+        let mut disk = vec![0u8; base + partition_size];
+        {
+            let backend = CursorDisk {
+                data: &mut disk,
+                pos: 0,
+                sector_size: 512,
+            };
+            let view = PartitionView::new(backend, base as u64, partition_size as u64);
+            let mut io = SectorIo::new(view, 512);
+            let options = fatfs::FormatVolumeOptions::new()
+                .fat_type(fatfs::FatType::Fat32)
+                .bytes_per_sector(512)
+                .total_sectors((partition_size as u64 / 512) as u32)
+                .volume_label(*b"BIGUSB     ");
+            fatfs::format_volume(&mut io, options).expect("format should succeed");
+        }
+        assert_eq!(disk[base + 510], 0x55);
+        assert_eq!(disk[base + 511], 0xAA);
+        assert_eq!(&disk[base + 71..base + 82], b"BIGUSB     ");
+    }
+
+    /// Strict sector backend over a borrowed mutable disk image.
+    struct CursorDisk<'a> {
+        data: &'a mut [u8],
+        pos: u64,
+        sector_size: u64,
+    }
+
+    impl CursorDisk<'_> {
+        fn reject_unaligned(&self, len: usize) -> std::io::Result<()> {
+            if self.pos % self.sector_size != 0 || len as u64 % self.sector_size != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "parameter is incorrect",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl Read for CursorDisk<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reject_unaligned(buf.len())?;
+            let start = self.pos as usize;
+            let end = start + buf.len();
+            buf.copy_from_slice(&self.data[start..end]);
+            self.pos = end as u64;
+            Ok(buf.len())
+        }
+    }
+
+    impl Write for CursorDisk<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.reject_unaligned(buf.len())?;
+            let start = self.pos as usize;
+            let end = start + buf.len();
+            self.data[start..end].copy_from_slice(buf);
+            self.pos = end as u64;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Seek for CursorDisk<'_> {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            let new_pos = match pos {
+                SeekFrom::Start(n) => n as i64,
+                SeekFrom::End(n) => self.data.len() as i64 + n,
+                SeekFrom::Current(n) => self.pos as i64 + n,
+            };
+            if new_pos < 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "seek before start",
+                ));
+            }
+            self.pos = new_pos as u64;
+            Ok(self.pos)
+        }
     }
 }

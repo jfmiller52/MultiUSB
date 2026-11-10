@@ -11,7 +11,7 @@ MultiUSB is a small Windows desktop app that does the same job with the choices 
 ## Goals
 
 - Pick a source folder and copy its contents onto one or more removable disks.
-- Choose a filesystem (FAT32, NTFS, exFAT, or Large FAT32), a partition style (MBR or GPT), and a volume label. None of those three is pre-filled.
+- Choose a filesystem (FAT32, NTFS, or exFAT), a partition style (MBR or GPT), and a volume label. None of those three is pre-filled.
 - Show only disks Windows reports as removable, and wipe only the ones the user checks.
 - Wipe the whole selected disk: remove the partition table, create one new partition, quick-format it, then copy.
 - Copy to every successfully prepared drive at the same time, with a progress bar per drive and one overall bar.
@@ -45,7 +45,7 @@ MultiUSB is a small Windows desktop app that does the same job with the choices 
 - The process must be elevated. `diskpart clean` fails otherwise.
 - UI toolkit is iced (current stable crate). The window stays responsive while format, copy, and verify run off the UI thread.
 - Workspace is `C:\MultiUSB`. This is a new Rust project.
-- Windows `diskpart` and `format` refuse FAT32 on a volume larger than 32 GB. Large FAT32 is a separate choice and is formatted in-process with the MIT `fatfs` crate after diskpart creates and assigns the partition (see `docs/superpowers/specs/2026-11-10-built-in-large-fat32-design.md`).
+- Windows `diskpart` and `format` refuse FAT32 on a volume larger than 32 GB. Choosing FAT32 on a larger disk still works: diskpart creates and assigns the partition, then MultiUSB formats it in-process with the MIT `fatfs` crate (see `docs/superpowers/specs/2026-11-10-built-in-large-fat32-design.md`).
 - The source tree beside the batch file is large (provisioning files, scripts, binaries). Copy progress has to be byte-based so a long copy does not look frozen.
 
 ## Approaches
@@ -63,7 +63,7 @@ iced is the choice. Concurrent copies were chosen with it: the batch file alread
 The window has these fields:
 
 - Source folder, with a browse button. Required. The copy places the *contents* of this folder at the root of each stick, matching `robocopy source dest /E`. Blank at first launch.
-- Filesystem, a dropdown with no selection at first launch. The entries are FAT32, NTFS, exFAT, and Large FAT32.
+- Filesystem, a dropdown with no selection at first launch. The entries are FAT32, NTFS, and exFAT.
 - Partition style, a dropdown with no selection at first launch. The entries are MBR and GPT.
 - Volume label, a text box. Blank at first launch. Empty is a valid label. Text that is present must be valid for the chosen filesystem.
 - A checklist of removable disks. Nothing is checked when the list loads or refreshes.
@@ -111,8 +111,7 @@ Filesystem behavior:
 
 - **NTFS.** `format fs=ntfs` in the script above. Label limit 32 characters.
 - **exFAT.** `format fs=exfat` in the script above. Label limit 15 characters.
-- **FAT32.** `format fs=fat32` in the script above. Label limit 11 characters. If the disk is larger than 32 GB, do not call `diskpart`. Fail that disk and tell the user to choose Large FAT32. Other disks continue.
-- **Large FAT32.** Always, at any size: diskpart cleans, converts, creates a primary partition, and assigns a letter with no `format` line; then MultiUSB locks the volume and formats it as FAT32 in-process via `fatfs`, including the 11-character volume label. Other disks continue on failure.
+- **FAT32.** Label limit 11 characters. At or under 32 GiB: `format fs=fat32` in the script above. Above 32 GiB: diskpart cleans, converts, creates a primary partition, and assigns a letter with no `format` line; then MultiUSB formats the partition in-process via `fatfs` (physical disk + partition offset while the volume is locked/dismounted), including the 11-character volume label. Other disks continue on failure.
 
 Label text written into the diskpart script may contain only letters, digits, space, hyphen, and underscore. Reject anything else before the job starts. Show the character limit beside the field once a filesystem is selected, and refuse Start when the label is too long for that filesystem.
 

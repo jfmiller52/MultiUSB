@@ -1,11 +1,13 @@
-# Built-in Large FAT32 Design
+# Built-in FAT32 (>32 GiB) Design
 
-**Goal.** Format Large FAT32 inside MultiUSB with no `fat32format.exe` sidecar.
+**Goal.** Format FAT32 on disks larger than Windows' diskpart limit inside MultiUSB with no `fat32format.exe` sidecar, and without a separate dropdown choice.
 
-**Approach.** Keep diskpart for wipe/partition/assign. Drop the NTFS handoff format line. After a drive letter appears, open the raw volume, lock it, and call MIT `fatfs::format_volume` with `FatType::Fat32` and the padded 11-byte volume label. No separate `label` command on this path.
+**UI.** Filesystem dropdown is FAT32, NTFS, exFAT. Choosing FAT32 is enough; size decides the path.
 
-**Host API.** `VolumeHost::format_large_fat32(letter: char, label: &str) -> Result<(), String>`. Windows host owns open/lock/`fatfs`/unlock. Fakes record the call for unit tests.
+**Approach.** Keep diskpart for wipe/partition/assign. For FAT32 ≤32 GiB, diskpart also quick-formats. For FAT32 >32 GiB, diskpart assigns a letter with no `format` line; then MultiUSB locks and dismounts the volume letter, formats the partition through `\\.\PhysicalDriveN` at the partition offset via MIT `fatfs::format_volume` (`FatType::Fat32` + padded 11-byte volume label), and unlocks. No separate `label` command on this path.
 
-**Removals.** `fat32format_beside_exe`, `fat32format_command`, `PrepareFailure::MissingFat32Format`, and docs that tell users to ship the helper.
+**Host API.** `VolumeHost::format_large_fat32(disk_number, letter, label) -> Result<(), String>`. Windows host owns lock/dismount/physical/`fatfs`/unlock. Fakes record the call for unit tests.
 
-**Out of scope.** Regular ≤32 GiB FAT32 (still diskpart). Copy/verify. Shipping any helper binary.
+**Removals.** `fat32format_beside_exe`, `fat32format_command`, `PrepareFailure::MissingFat32Format`, `PrepareFailure::Fat32TooLarge`, the Large FAT32 dropdown entry, and docs that tell users to ship the helper.
+
+**Out of scope.** Copy/verify. Shipping any helper binary.

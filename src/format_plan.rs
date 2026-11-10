@@ -5,8 +5,8 @@ pub const FAT32_MAX_INCLUSIVE_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreparePlan {
     Script(String),
-    Fat32TooLarge,
-    LargeFat32 { script: String },
+    /// FAT32 above Windows' diskpart limit: wipe/partition/assign only, then in-process format.
+    BuiltInFat32 { script: String },
 }
 
 fn convert_token(style: PartitionStyle) -> &'static str {
@@ -38,10 +38,7 @@ pub fn prepare_plan(
     size_bytes: u64,
 ) -> PreparePlan {
     if matches!(filesystem, Filesystem::Fat32) && size_bytes > FAT32_MAX_INCLUSIVE_BYTES {
-        return PreparePlan::Fat32TooLarge;
-    }
-    if matches!(filesystem, Filesystem::LargeFat32) {
-        return PreparePlan::LargeFat32 {
+        return PreparePlan::BuiltInFat32 {
             script: build_assign_only_script(disk_number, style),
         };
     }
@@ -54,7 +51,6 @@ fn format_line_for(filesystem: Filesystem, label: &str) -> String {
         Filesystem::Ntfs => "ntfs",
         Filesystem::ExFat => "exfat",
         Filesystem::Fat32 => "fat32",
-        Filesystem::LargeFat32 => unreachable!(),
     };
     format!("format fs={fs} quick label=\"{label}\"")
 }
@@ -97,7 +93,7 @@ mod tests {
     }
 
     #[test]
-    fn fat32_size_gate_and_large_fat32() {
+    fn fat32_uses_diskpart_at_or_under_limit_and_builtin_above() {
         let limit = FAT32_MAX_INCLUSIVE_BYTES;
         assert_eq!(
             prepare_plan(2, PartitionStyle::Gpt, Filesystem::Fat32, "LAB", limit),
@@ -105,18 +101,14 @@ mod tests {
         );
         assert_eq!(
             prepare_plan(2, PartitionStyle::Gpt, Filesystem::Fat32, "LAB", limit + 1),
-            PreparePlan::Fat32TooLarge
-        );
-        assert_eq!(
-            prepare_plan(2, PartitionStyle::Mbr, Filesystem::LargeFat32, "LAB", limit + 1),
-            PreparePlan::LargeFat32 {
-                script: assign_only_script(2, "mbr")
+            PreparePlan::BuiltInFat32 {
+                script: assign_only_script(2, "gpt")
             }
         );
         assert_eq!(
-            prepare_plan(2, PartitionStyle::Gpt, Filesystem::LargeFat32, "LAB", 1024),
-            PreparePlan::LargeFat32 {
-                script: assign_only_script(2, "gpt")
+            prepare_plan(2, PartitionStyle::Mbr, Filesystem::Fat32, "LAB", limit + 1),
+            PreparePlan::BuiltInFat32 {
+                script: assign_only_script(2, "mbr")
             }
         );
     }

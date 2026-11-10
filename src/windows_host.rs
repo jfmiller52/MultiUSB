@@ -163,9 +163,14 @@ impl VolumeHost for WindowsHost {
         }
     }
 
-    fn format_large_fat32(&mut self, letter: char, label: &str) -> Result<(), String> {
+    fn format_large_fat32(
+        &mut self,
+        disk_number: u32,
+        letter: char,
+        label: &str,
+    ) -> Result<(), String> {
         self.stop_if_closed();
-        format_large_fat32_volume(letter, label)
+        format_large_fat32_volume(disk_number, letter, label)
     }
 
     fn exe_path(&self) -> PathBuf {
@@ -243,135 +248,212 @@ fn fat32_total_sectors(length_bytes: i64) -> Result<u32, &'static str> {
     Ok(total_sectors as u32)
 }
 
-fn format_large_fat32_volume(letter: char, label: &str) -> Result<(), String> {
+fn format_large_fat32_volume(
+    disk_number: u32,
+    letter: char,
+    label: &str,
+) -> Result<(), String> {
     #[cfg(windows)]
     {
-        format_large_fat32_volume_windows(letter, label)
+        format_large_fat32_volume_windows(disk_number, letter, label)
     }
     #[cfg(not(windows))]
     {
-        let _ = (letter, label);
-        Err("Large FAT32 format requires Windows".to_string())
+        let _ = (disk_number, letter, label);
+        Err("FAT32 built-in format requires Windows".to_string())
     }
 }
 
 #[cfg(windows)]
-fn format_large_fat32_volume_windows(letter: char, label: &str) -> Result<(), String> {
+fn open_shared_rw(path: &str) -> Result<std::fs::File, String> {
     use std::fs::OpenOptions;
-    use std::io::{Seek, SeekFrom};
-    use std::mem::size_of_val;
     use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    let mut last_err = None;
+    for attempt in 0..10 {
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
+            .open(path)
+        {
+            Ok(file) => return Ok(file),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt + 1 < 10 {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+        }
+    }
+    Err(format!(
+        "open {path}: {}",
+        last_err
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "device did not appear".to_string())
+    ))
+}
+
+#[cfg(windows)]
+fn first_partition_extent(physical: &std::fs::File) -> Result<(u64, u64), String> {
+    use std::mem::size_of;
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
     use windows::Win32::System::IO::DeviceIoControl;
     use windows::Win32::System::Ioctl::{
-        FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME, FSCTL_UNLOCK_VOLUME, GET_LENGTH_INFORMATION,
-        IOCTL_DISK_GET_LENGTH_INFO,
+        DRIVE_LAYOUT_INFORMATION_EX, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, PARTITION_INFORMATION_EX,
     };
 
-    let path = format!(r"\\.\{letter}:");
-    // Lock requires share read/write on the open handle. Retry briefly while
-    // Windows finishes creating the volume after `assign letter=`.
-    let file = {
-        let mut last_err = None;
-        let mut opened = None;
-        for attempt in 0..10 {
-            match OpenOptions::new()
-                .read(true)
-                .write(true)
-                .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
-                .open(&path)
-            {
-                Ok(file) => {
-                    opened = Some(file);
-                    break;
-                }
-                Err(err) => {
-                    last_err = Some(err);
-                    if attempt + 1 < 10 {
-                        std::thread::sleep(std::time::Duration::from_millis(200));
-                    }
-                }
-            }
-        }
-        match opened {
-            Some(file) => file,
-            None => {
-                return Err(format!(
-                    "open {path}: {}",
-                    last_err.map(|err| err.to_string()).unwrap_or_else(|| {
-                        "volume did not appear after assign".to_string()
-                    })
-                ));
-            }
-        }
-    };
-
-    let handle = HANDLE(file.as_raw_handle());
-    let unlock = || unsafe {
-        let _ = DeviceIoControl(handle, FSCTL_UNLOCK_VOLUME, None, 0, None, 0, None, None);
-    };
-
-    // Microsoft's format sequence is lock → format → dismount → unlock.
-    // Dismounting before writes makes the volume evaporate (os error 433).
-    unsafe {
-        DeviceIoControl(handle, FSCTL_LOCK_VOLUME, None, 0, None, 0, None, None)
-            .map_err(|err| format!("lock {path}: {err}"))?;
-    }
-
-    let mut length_info = GET_LENGTH_INFORMATION::default();
+    let entry_size = size_of::<PARTITION_INFORMATION_EX>();
+    let header_size = size_of::<DRIVE_LAYOUT_INFORMATION_EX>();
+    let mut buffer = vec![0u8; header_size + entry_size * 16];
+    let handle = HANDLE(physical.as_raw_handle());
     let mut returned = 0u32;
-    let length_ok = unsafe {
+    unsafe {
         DeviceIoControl(
             handle,
-            IOCTL_DISK_GET_LENGTH_INFO,
+            IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
             None,
             0,
-            Some(&mut length_info as *mut _ as *mut _),
-            size_of_val(&length_info) as u32,
+            Some(buffer.as_mut_ptr() as *mut _),
+            buffer.len() as u32,
             Some(&mut returned),
             None,
         )
-    };
-    if let Err(err) = length_ok {
-        unlock();
-        return Err(format!("volume length {path}: {err}"));
+        .map_err(|err| format!("drive layout: {err}"))?;
     }
-    let total_sectors = match fat32_total_sectors(length_info.Length) {
+    if (returned as usize) < header_size {
+        return Err("drive layout: short response".to_string());
+    }
+    let layout = unsafe { &*(buffer.as_ptr() as *const DRIVE_LAYOUT_INFORMATION_EX) };
+    let count = layout.PartitionCount as usize;
+    if count == 0 {
+        return Err("drive layout: no partitions".to_string());
+    }
+    let needed = header_size.saturating_sub(entry_size) + entry_size * count;
+    if (returned as usize) < needed || buffer.len() < needed {
+        return Err("drive layout: truncated partition list".to_string());
+    }
+    let entries = unsafe {
+        std::slice::from_raw_parts(layout.PartitionEntry.as_ptr(), count)
+    };
+    for entry in entries {
+        if entry.PartitionLength > 0 && entry.StartingOffset >= 0 {
+            return Ok((entry.StartingOffset as u64, entry.PartitionLength as u64));
+        }
+    }
+    Err("drive layout: no usable partition".to_string())
+}
+
+#[cfg(windows)]
+fn format_large_fat32_volume_windows(
+    disk_number: u32,
+    letter: char,
+    label: &str,
+) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom};
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::IO::DeviceIoControl;
+    use windows::Win32::System::Ioctl::{
+        FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME, FSCTL_UNLOCK_VOLUME,
+    };
+
+    let physical_path = format!(r"\\.\PhysicalDrive{disk_number}");
+    let volume_path = format!(r"\\.\{letter}:");
+
+    // Hold the volume locked+dismounted so Windows cannot remount while we write
+    // the filesystem through the physical disk at the partition offset. Writing
+    // via `\\.\X:` after diskpart assign has been unreliable (os error 433).
+    let volume = open_shared_rw(&volume_path)?;
+    let volume_handle = HANDLE(volume.as_raw_handle());
+    let unlock = || unsafe {
+        let _ = DeviceIoControl(
+            volume_handle,
+            FSCTL_UNLOCK_VOLUME,
+            None,
+            0,
+            None,
+            0,
+            None,
+            None,
+        );
+    };
+    unsafe {
+        DeviceIoControl(
+            volume_handle,
+            FSCTL_LOCK_VOLUME,
+            None,
+            0,
+            None,
+            0,
+            None,
+            None,
+        )
+        .map_err(|err| format!("lock {volume_path}: {err}"))?;
+        DeviceIoControl(
+            volume_handle,
+            FSCTL_DISMOUNT_VOLUME,
+            None,
+            0,
+            None,
+            0,
+            None,
+            None,
+        )
+        .map_err(|err| {
+            unlock();
+            format!("dismount {volume_path}: {err}")
+        })?;
+    }
+
+    let physical = match open_shared_rw(&physical_path) {
+        Ok(file) => file,
+        Err(err) => {
+            unlock();
+            return Err(err);
+        }
+    };
+    let (offset, length) = match first_partition_extent(&physical) {
+        Ok(extent) => extent,
+        Err(err) => {
+            unlock();
+            return Err(err);
+        }
+    };
+    let total_sectors = match fat32_total_sectors(length as i64) {
         Ok(sectors) => sectors,
         Err(reason) => {
             unlock();
-            return Err(format!("volume length {path}: {reason}"));
+            return Err(format!("partition length on {physical_path}: {reason}"));
         }
     };
 
-    // fatfs issues many sub-sector writes; Windows volume handles reject those
-    // with ERROR_INVALID_PARAMETER (87) unless we coalesce to whole sectors.
-    let mut volume = crate::sector_io::SectorIo::new(file, 512);
-    if let Err(err) = volume.seek(SeekFrom::Start(0)) {
+    let view = crate::sector_io::PartitionView::new(physical, offset, length);
+    let mut volume_io = crate::sector_io::SectorIo::new(view, 512);
+    if let Err(err) = volume_io.seek(SeekFrom::Start(0)) {
         unlock();
-        return Err(format!("seek {path}: {err}"));
+        return Err(format!("seek {physical_path}+{offset}: {err}"));
     }
     let options = fatfs::FormatVolumeOptions::new()
         .fat_type(fatfs::FatType::Fat32)
         .bytes_per_sector(512)
         .total_sectors(total_sectors)
         .volume_label(pad_fat_volume_label(label));
-    let format_result = fatfs::format_volume(&mut volume, options)
-        .map_err(|err| format!("fatfs format {path}: {err}"));
-    let file = volume.into_inner();
+    let format_result = fatfs::format_volume(&mut volume_io, options).map_err(|err| {
+        format!("fatfs format {physical_path} offset {offset}: {err}")
+    });
+    let physical = volume_io.into_inner().into_inner();
     if format_result.is_ok() {
-        if let Err(err) = file.sync_all() {
+        if let Err(err) = physical.sync_all() {
             unlock();
-            return Err(format!("flush {path}: {err}"));
+            return Err(format!("flush {physical_path}: {err}"));
         }
     }
-
-    unsafe {
-        let _ = DeviceIoControl(handle, FSCTL_DISMOUNT_VOLUME, None, 0, None, 0, None, None);
-    }
     unlock();
+    // Keep `volume` alive until unlock so the lock handle stays valid.
+    drop(volume);
     format_result
 }
 

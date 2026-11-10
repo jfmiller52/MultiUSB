@@ -3,29 +3,22 @@ pub enum Filesystem {
     Fat32,
     Ntfs,
     ExFat,
-    LargeFat32,
 }
 
 impl Filesystem {
-    pub const ALL: [Filesystem; 4] = [
-        Filesystem::Fat32,
-        Filesystem::Ntfs,
-        Filesystem::ExFat,
-        Filesystem::LargeFat32,
-    ];
+    pub const ALL: [Filesystem; 3] = [Filesystem::Fat32, Filesystem::Ntfs, Filesystem::ExFat];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Filesystem::Fat32 => "FAT32",
             Filesystem::Ntfs => "NTFS",
             Filesystem::ExFat => "exFAT",
-            Filesystem::LargeFat32 => "Large FAT32",
         }
     }
 
     pub fn label_limit(self) -> usize {
         match self {
-            Filesystem::Fat32 | Filesystem::LargeFat32 => 11,
+            Filesystem::Fat32 => 11,
             Filesystem::ExFat => 15,
             Filesystem::Ntfs => 32,
         }
@@ -81,9 +74,8 @@ mod tests {
     #[test]
     fn dropdown_order_and_limits() {
         let names: Vec<_> = Filesystem::ALL.iter().map(|fs| fs.as_str()).collect();
-        assert_eq!(names, ["FAT32", "NTFS", "exFAT", "Large FAT32"]);
+        assert_eq!(names, ["FAT32", "NTFS", "exFAT"]);
         assert_eq!(Filesystem::Fat32.label_limit(), 11);
-        assert_eq!(Filesystem::LargeFat32.label_limit(), 11);
         assert_eq!(Filesystem::ExFat.label_limit(), 15);
         assert_eq!(Filesystem::Ntfs.label_limit(), 32);
         let parts: Vec<_> = PartitionStyle::ALL.iter().map(|p| p.as_str()).collect();

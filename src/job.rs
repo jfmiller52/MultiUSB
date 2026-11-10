@@ -14,13 +14,17 @@ pub trait VolumeHost {
     /// Next unused drive letter (D–Z) for an explicit `diskpart assign letter=`.
     fn free_drive_letter(&mut self) -> Result<char, String>;
     fn run_command(&mut self, cmd: &ExternalCommand) -> Result<(), String>;
-    fn format_large_fat32(&mut self, letter: char, label: &str) -> Result<(), String>;
+    fn format_large_fat32(
+        &mut self,
+        disk_number: u32,
+        letter: char,
+        label: &str,
+    ) -> Result<(), String>;
     fn exe_path(&self) -> PathBuf;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrepareFailure {
-    Fat32TooLarge,
     Rematch(Rematch),
     Diskpart,
     NoLetter,
@@ -202,9 +206,10 @@ fn prepare_disk(
     }
     let (result, cleaned) =
         match prepare_plan(disk.number, style, filesystem, label, disk.size_bytes) {
-            PreparePlan::Fat32TooLarge => (Err(PrepareFailure::Fat32TooLarge), None),
             PreparePlan::Script(script) => finish_script(host, &disk, &script),
-            PreparePlan::LargeFat32 { script } => finish_large_fat32(host, &disk, &script, label),
+            PreparePlan::BuiltInFat32 { script } => {
+                finish_builtin_fat32(host, &disk, &script, label)
+            }
         };
     DiskStep::Finished { result, cleaned }
 }
@@ -226,7 +231,7 @@ fn finish_script(
     (Ok(prepared_disk(disk, letter)), cleaned)
 }
 
-fn finish_large_fat32(
+fn finish_builtin_fat32(
     host: &mut dyn VolumeHost,
     disk: &EnumeratedDisk,
     script: &str,
@@ -241,7 +246,7 @@ fn finish_large_fat32(
         return (Err(PrepareFailure::Diskpart), None);
     }
     let cleaned = Some(cleaned_disk(disk));
-    if let Err(message) = host.format_large_fat32(letter, label) {
+    if let Err(message) = host.format_large_fat32(disk.number, letter, label) {
         return (Err(PrepareFailure::Command(message)), cleaned);
     }
     (Ok(prepared_disk(disk, letter)), cleaned)
@@ -357,7 +362,6 @@ fn verify_copied(target: &CopyTarget) -> DriveOutcome {
 
 pub fn failure_text(failure: &PrepareFailure) -> &'static str {
     match failure {
-        PrepareFailure::Fat32TooLarge => "Choose Large FAT32. Disk is larger than 32 GB.",
         PrepareFailure::Rematch(Rematch::NotUnique | Rematch::Unique(_)) => {
             "Disk could not be matched uniquely."
         }
@@ -401,7 +405,7 @@ mod tests {
         letters: Vec<(String, Result<Option<char>, String>)>,
         commands: Vec<ExternalCommand>,
         command_error: Option<String>,
-        format_calls: Vec<(char, String)>,
+        format_calls: Vec<(u32, char, String)>,
         format_error: Option<String>,
         format_errors_queue: Vec<String>,
         free_letters: Vec<char>,
@@ -487,8 +491,14 @@ mod tests {
             }
         }
 
-        fn format_large_fat32(&mut self, letter: char, label: &str) -> Result<(), String> {
-            self.format_calls.push((letter, label.to_string()));
+        fn format_large_fat32(
+            &mut self,
+            disk_number: u32,
+            letter: char,
+            label: &str,
+        ) -> Result<(), String> {
+            self.format_calls
+                .push((disk_number, letter, label.to_string()));
             if !self.format_errors_queue.is_empty() {
                 return Err(self.format_errors_queue.remove(0));
             }
@@ -636,11 +646,12 @@ mod tests {
     }
 
     #[test]
-    fn fat32_over_limit_records_no_script_and_the_next_disk_still_gets_one() {
+    fn fat32_over_limit_uses_builtin_format_and_small_disk_uses_diskpart() {
         let big = removable(2, "Big", "USB\\BIG", FAT32_MAX_INCLUSIVE_BYTES + 1);
         let small = removable(3, "Small", "USB\\SMALL", 1024);
         let selected = ids(&[big.clone(), small.clone()]);
         let mut host = FakeHost::new(vec![Ok(vec![big, small])]);
+        host.free_letter('E');
         host.free_letter('F');
         let mut on_prepare = notices(&host);
 
@@ -655,7 +666,13 @@ mod tests {
 
         match result {
             PrepareAll::Done(results) => {
-                assert!(matches!(results[0], Err(PrepareFailure::Fat32TooLarge)));
+                match &results[0] {
+                    Ok(prepared) => {
+                        assert_eq!(prepared.letter, 'E');
+                        assert_eq!(prepared.model, "Big");
+                    }
+                    Err(failure) => panic!("big disk should prepare, got {failure:?}"),
+                }
                 match &results[1] {
                     Ok(prepared) => {
                         assert_eq!(prepared.letter, 'F');
@@ -669,17 +686,22 @@ mod tests {
         }
         assert_eq!(
             host.scripts,
-            vec![format_assign_letter_script(
-                3,
-                "gpt",
-                "format fs=fat32 quick label=\"STORE\"",
-                'F'
-            )]
+            vec![
+                assign_letter_script(2, "gpt", 'E'),
+                format_assign_letter_script(
+                    3,
+                    "gpt",
+                    "format fs=fat32 quick label=\"STORE\"",
+                    'F'
+                ),
+            ]
         );
+        assert_eq!(host.format_calls, vec![(2, 'E', "STORE".to_string())]);
         assert_eq!(
             marks(&host),
             vec![
                 Mark::Formatting { index: 0, total: 2 },
+                Mark::Script,
                 Mark::Finished(0),
                 Mark::Formatting { index: 1, total: 2 },
                 Mark::Script,
@@ -749,8 +771,8 @@ mod tests {
     }
 
     #[test]
-    fn large_fat32_runs_assign_script_then_format_large_fat32() {
-        let stick = removable(4, "Wide", "USB\\WIDE", 1024);
+    fn fat32_under_limit_does_not_call_builtin_format() {
+        let stick = removable(4, "Wide", "USB\\WIDE", FAT32_MAX_INCLUSIVE_BYTES);
         let selected = ids(&[stick.clone()]);
         let mut host = FakeHost::new(vec![Ok(vec![stick])]);
         host.free_letter('E');
@@ -758,7 +780,7 @@ mod tests {
 
         let result = prepare_all(
             &selected,
-            Filesystem::LargeFat32,
+            Filesystem::Fat32,
             PartitionStyle::Mbr,
             "STORE",
             &mut host,
@@ -771,17 +793,25 @@ mod tests {
                     assert_eq!(prepared.letter, 'E');
                     assert_eq!(prepared.model, "Wide");
                 }
-                Err(failure) => panic!("large fat32 should prepare, got {failure:?}"),
+                Err(failure) => panic!("fat32 should prepare, got {failure:?}"),
             },
             PrepareAll::AbortSystemDisk { .. } => panic!("expected the disk to finish"),
         }
-        assert_eq!(host.scripts, vec![assign_letter_script(4, "mbr", 'E')]);
-        assert_eq!(host.format_calls, vec![('E', "STORE".to_string())]);
+        assert_eq!(
+            host.scripts,
+            vec![format_assign_letter_script(
+                4,
+                "mbr",
+                "format fs=fat32 quick label=\"STORE\"",
+                'E'
+            )]
+        );
+        assert!(host.format_calls.is_empty());
         assert!(host.commands.is_empty());
     }
 
     #[test]
-    fn large_fat32_format_error_is_command_failure() {
+    fn fat32_builtin_format_error_is_command_failure() {
         let stick = removable(4, "Wide", "USB\\WIDE", FAT32_MAX_INCLUSIVE_BYTES + 1);
         let selected = ids(&[stick.clone()]);
         let mut host = FakeHost::new(vec![Ok(vec![stick])]);
@@ -791,7 +821,7 @@ mod tests {
 
         let result = prepare_all(
             &selected,
-            Filesystem::LargeFat32,
+            Filesystem::Fat32,
             PartitionStyle::Gpt,
             "STORE",
             &mut host,
@@ -806,14 +836,14 @@ mod tests {
             PrepareAll::AbortSystemDisk { .. } => panic!("expected the disk to finish"),
         }
         assert_eq!(host.scripts, vec![assign_letter_script(4, "gpt", 'E')]);
-        assert_eq!(host.format_calls, vec![('E', "STORE".to_string())]);
+        assert_eq!(host.format_calls, vec![(4, 'E', "STORE".to_string())]);
         assert!(host.commands.is_empty());
     }
 
     #[test]
-    fn large_fat32_format_error_on_first_disk_still_prepares_second() {
-        let first = removable(4, "Wide", "USB\\WIDE", 1024);
-        let second = removable(5, "Narrow", "USB\\NARROW", 1024);
+    fn fat32_builtin_format_error_on_first_disk_still_prepares_second() {
+        let first = removable(4, "Wide", "USB\\WIDE", FAT32_MAX_INCLUSIVE_BYTES + 1);
+        let second = removable(5, "Narrow", "USB\\NARROW", FAT32_MAX_INCLUSIVE_BYTES + 1);
         let selected = ids(&[first.clone(), second.clone()]);
         let mut host = FakeHost::new(vec![Ok(vec![first, second])]);
         host.free_letter('E');
@@ -824,7 +854,7 @@ mod tests {
 
         let result = prepare_all(
             &selected,
-            Filesystem::LargeFat32,
+            Filesystem::Fat32,
             PartitionStyle::Gpt,
             "STORE",
             &mut host,
@@ -853,7 +883,10 @@ mod tests {
         );
         assert_eq!(
             host.format_calls,
-            vec![('E', "STORE".to_string()), ('F', "STORE".to_string())]
+            vec![
+                (4, 'E', "STORE".to_string()),
+                (5, 'F', "STORE".to_string())
+            ]
         );
     }
 
@@ -1096,15 +1129,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_letter_skips_format_large_fat32() {
-        let stick = removable(4, "Wide", "USB\\WIDE", 1024);
+    fn missing_letter_skips_builtin_fat32_format() {
+        let stick = removable(4, "Wide", "USB\\WIDE", FAT32_MAX_INCLUSIVE_BYTES + 1);
         let selected = ids(&[stick.clone()]);
         let mut host = FakeHost::new(vec![Ok(vec![stick])]);
         let mut on_prepare = notices(&host);
 
         let result = prepare_all(
             &selected,
-            Filesystem::LargeFat32,
+            Filesystem::Fat32,
             PartitionStyle::Gpt,
             "STORE",
             &mut host,
@@ -1205,10 +1238,6 @@ mod tests {
 
     #[test]
     fn failure_text_returns_the_prepare_messages() {
-        assert_eq!(
-            failure_text(&PrepareFailure::Fat32TooLarge),
-            "Choose Large FAT32. Disk is larger than 32 GB."
-        );
         assert_eq!(
             failure_text(&PrepareFailure::Rematch(Rematch::NotUnique)),
             "Disk could not be matched uniquely."
