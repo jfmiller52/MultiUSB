@@ -38,6 +38,7 @@ pub struct Prepared {
 pub struct CleanedDisk {
     pub number: u32,
     pub model: String,
+    pub serial: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,21 +46,32 @@ pub enum PrepareAll {
     AbortSystemDisk {
         number: u32,
         model: String,
+        serial: Option<String>,
         cleaned: Vec<CleanedDisk>,
     },
     Done(Vec<Result<Prepared, PrepareFailure>>),
 }
 
-pub fn system_disk_stop_message(number: u32, model: &str, cleaned: &[CleanedDisk]) -> String {
-    let system = format!("Disk {number} ({model}) contains the Windows system volume.");
+pub fn system_disk_stop_message(
+    number: u32,
+    model: &str,
+    serial: Option<&str>,
+    cleaned: &[CleanedDisk],
+) -> String {
+    use crate::session::disk_log_name;
+
+    let system = format!(
+        "{} contains the Windows system volume.",
+        disk_log_name(number, model, serial)
+    );
     if cleaned.is_empty() {
         return format!("Stopped before any wipe. {system}");
     }
     let mut lines = Vec::with_capacity(cleaned.len() + 1);
     for disk in cleaned {
         lines.push(format!(
-            "Disk {} ({}) was already cleaned.",
-            disk.number, disk.model
+            "{} was already cleaned.",
+            disk_log_name(disk.number, &disk.model, disk.serial.as_deref())
         ));
     }
     lines.push(system);
@@ -76,6 +88,7 @@ enum DiskStep {
     Abort {
         number: u32,
         model: String,
+        serial: Option<String>,
     },
     Finished {
         result: Result<Prepared, PrepareFailure>,
@@ -102,10 +115,16 @@ pub fn prepare_all(
             );
         }
     };
-    if let Gate::AbortSystemDisk { number, model } = gate(selected, &current) {
+    if let Gate::AbortSystemDisk {
+        number,
+        model,
+        serial,
+    } = gate(selected, &current)
+    {
         return PrepareAll::AbortSystemDisk {
             number,
             model,
+            serial,
             cleaned: Vec::new(),
         };
     }
@@ -116,10 +135,15 @@ pub fn prepare_all(
     for (index, id) in selected.iter().enumerate() {
         on_prepare(PrepareNotice::Formatting { index, total });
         match prepare_disk(id, filesystem, style, label, host) {
-            DiskStep::Abort { number, model } => {
+            DiskStep::Abort {
+                number,
+                model,
+                serial,
+            } => {
                 return PrepareAll::AbortSystemDisk {
                     number,
                     model,
+                    serial,
                     cleaned,
                 };
             }
@@ -173,6 +197,7 @@ fn prepare_disk(
         return DiskStep::Abort {
             number: disk.number,
             model: disk.model,
+            serial: disk.id.serial,
         };
     }
     let (result, cleaned) =
@@ -230,6 +255,7 @@ fn cleaned_disk(disk: &EnumeratedDisk) -> CleanedDisk {
     CleanedDisk {
         number: disk.number,
         model: disk.model.clone(),
+        serial: disk.id.serial.clone(),
     }
 }
 
@@ -556,12 +582,14 @@ mod tests {
             PrepareAll::AbortSystemDisk {
                 number: 2,
                 model,
+                serial,
                 cleaned,
             } if model == "System USB" => {
                 assert!(cleaned.is_empty());
+                assert_eq!(serial, None);
                 assert_eq!(
-                    system_disk_stop_message(2, &model, &cleaned),
-                    "Stopped before any wipe. Disk 2 (System USB) contains the Windows system volume."
+                    system_disk_stop_message(2, &model, serial.as_deref(), &cleaned),
+                    "Stopped before any wipe. Disk 2 (System USB) · S/N unavailable contains the Windows system volume."
                 );
             }
             other => panic!("expected the first inventory to abort, got {other:?}"),
@@ -781,8 +809,12 @@ mod tests {
 
         assert!(matches!(
             result,
-            PrepareAll::AbortSystemDisk { number: 1, model, cleaned }
-                if model == "System USB" && cleaned.is_empty()
+            PrepareAll::AbortSystemDisk {
+                number: 1,
+                model,
+                cleaned,
+                ..
+            } if model == "System USB" && cleaned.is_empty()
         ));
         assert!(host.scripts.is_empty());
         assert_eq!(marks(&host), vec![Mark::Formatting { index: 0, total: 2 }]);
@@ -868,13 +900,14 @@ mod tests {
             PrepareAll::AbortSystemDisk {
                 number,
                 model,
+                serial,
                 cleaned,
             } => {
                 assert_eq!(number, 2);
                 assert_eq!(model, "System USB");
                 assert_eq!(
-                    system_disk_stop_message(number, &model, &cleaned),
-                    "Disk 1 (Safe) was already cleaned. Disk 2 (System USB) contains the Windows system volume."
+                    system_disk_stop_message(number, &model, serial.as_deref(), &cleaned),
+                    "Disk 1 (Safe) · S/N unavailable was already cleaned. Disk 2 (System USB) · S/N unavailable contains the Windows system volume."
                 );
             }
             PrepareAll::Done(results) => panic!("expected abort, got {results:?}"),

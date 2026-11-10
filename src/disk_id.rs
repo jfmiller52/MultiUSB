@@ -58,7 +58,11 @@ pub fn rematch(selected: &DiskId, current: &[EnumeratedDisk]) -> Rematch {
 
 pub enum Gate {
     Ready(Vec<Result<EnumeratedDisk, Rematch>>),
-    AbortSystemDisk { number: u32, model: String },
+    AbortSystemDisk {
+        number: u32,
+        model: String,
+        serial: Option<String>,
+    },
 }
 
 pub fn gate(selected: &[DiskId], current: &[EnumeratedDisk]) -> Gate {
@@ -75,6 +79,7 @@ pub fn gate(selected: &[DiskId], current: &[EnumeratedDisk]) -> Gate {
                     return Gate::AbortSystemDisk {
                         number: disk.number,
                         model: disk.model.clone(),
+                        serial: disk.id.serial.clone(),
                     };
                 }
                 results.push(Ok(disk.clone()));
@@ -187,9 +192,14 @@ mod tests {
         ];
         let selected = [id(Some("USB\\A"), None, 10), id(Some("USB\\B"), None, 20)];
         match gate(&selected, &current) {
-            Gate::AbortSystemDisk { number, model } => {
+            Gate::AbortSystemDisk {
+                number,
+                model,
+                serial,
+            } => {
                 assert_eq!(number, 2);
                 assert_eq!(model, "System USB");
+                assert_eq!(serial, None);
             }
             Gate::Ready(_) => panic!("expected abort"),
         }

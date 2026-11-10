@@ -79,6 +79,7 @@ enum JobEvent {
     Aborted {
         number: u32,
         model: String,
+        serial: Option<String>,
         cleaned: Vec<CleanedDisk>,
     },
     Prepared(Vec<Result<crate::job::Prepared, PrepareFailure>>),
@@ -474,10 +475,16 @@ impl App {
             JobEvent::Aborted {
                 number,
                 model,
+                serial,
                 cleaned,
             } => {
                 self.runs.clear();
-                self.publish_results(vec![system_disk_stop_message(number, &model, &cleaned)]);
+                self.publish_results(vec![system_disk_stop_message(
+                    number,
+                    &model,
+                    serial.as_deref(),
+                    &cleaned,
+                )]);
             }
             JobEvent::Prepared(results) => {
                 let mut slot = 0usize;
@@ -964,6 +971,7 @@ fn run_batch(
         PrepareAll::AbortSystemDisk {
             number,
             model,
+            serial,
             cleaned,
         } => {
             send_event(
@@ -971,6 +979,7 @@ fn run_batch(
                 JobEvent::Aborted {
                     number,
                     model,
+                    serial,
                     cleaned,
                 },
             );
