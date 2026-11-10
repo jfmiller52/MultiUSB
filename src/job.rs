@@ -428,10 +428,6 @@ mod tests {
             }
         }
 
-        fn letter(&mut self, pnp: &str, letter: char) {
-            self.letters.push((pnp.to_string(), Ok(Some(letter))));
-        }
-
         fn free_letter(&mut self, letter: char) {
             self.free_letters.push(letter);
         }
@@ -1073,7 +1069,6 @@ mod tests {
         );
     }
 
-    #[test]
     #[test]
     fn no_letter_after_format_fails_that_disk() {
         let stick = removable(5, "Bare", "USB\\BARE", 100);

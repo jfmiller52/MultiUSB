@@ -313,15 +313,11 @@ fn format_large_fat32_volume_windows(letter: char, label: &str) -> Result<(), St
         let _ = DeviceIoControl(handle, FSCTL_UNLOCK_VOLUME, None, 0, None, 0, None, None);
     };
 
+    // Microsoft's format sequence is lock → format → dismount → unlock.
+    // Dismounting before writes makes the volume evaporate (os error 433).
     unsafe {
         DeviceIoControl(handle, FSCTL_LOCK_VOLUME, None, 0, None, 0, None, None)
             .map_err(|err| format!("lock {path}: {err}"))?;
-        if let Err(err) =
-            DeviceIoControl(handle, FSCTL_DISMOUNT_VOLUME, None, 0, None, 0, None, None)
-        {
-            unlock();
-            return Err(format!("dismount {path}: {err}"));
-        }
     }
 
     let mut length_info = GET_LENGTH_INFORMATION::default();
@@ -372,6 +368,9 @@ fn format_large_fat32_volume_windows(letter: char, label: &str) -> Result<(), St
         }
     }
 
+    unsafe {
+        let _ = DeviceIoControl(handle, FSCTL_DISMOUNT_VOLUME, None, 0, None, 0, None, None);
+    }
     unlock();
     format_result
 }

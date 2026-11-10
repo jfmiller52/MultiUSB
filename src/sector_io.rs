@@ -38,6 +38,18 @@ impl<T: Read + Write + Seek> SectorIo<T> {
         Ok(())
     }
 
+    /// Load a sector for read-modify-write. Blank/RAW media may reject reads;
+    /// treat that as an all-zero sector so formatting can proceed.
+    fn load_sector_for_write(&mut self, sector_index: u64) -> io::Result<()> {
+        match self.read_sector(sector_index) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                self.buf.fill(0);
+                Ok(())
+            }
+        }
+    }
+
     fn write_sector(&mut self, sector_index: u64) -> io::Result<()> {
         let offset = sector_index * self.sector_size;
         self.inner.seek(SeekFrom::Start(offset))?;
@@ -70,8 +82,10 @@ impl<T: Read + Write + Seek> Write for SectorIo<T> {
         let offset_in_sector = (self.pos % self.sector_size) as usize;
         let take = min(data.len(), self.sector_size as usize - offset_in_sector);
         let whole_sector = offset_in_sector == 0 && take == self.sector_size as usize;
-        if !whole_sector {
-            self.read_sector(sector_index)?;
+        if whole_sector {
+            self.buf.fill(0);
+        } else {
+            self.load_sector_for_write(sector_index)?;
         }
         self.buf[offset_in_sector..offset_in_sector + take].copy_from_slice(&data[..take]);
         self.write_sector(sector_index)?;
@@ -207,6 +221,56 @@ mod tests {
         let mut backend = StrictSectors::new(512, 512);
         let err = backend.write_all(&[1, 2, 3]).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn write_succeeds_when_backend_reads_fail() {
+        struct WriteOnly {
+            data: Vec<u8>,
+            pos: u64,
+        }
+        impl Read for WriteOnly {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "device does not exist",
+                ))
+            }
+        }
+        impl Write for WriteOnly {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let start = self.pos as usize;
+                let end = start + buf.len();
+                self.data[start..end].copy_from_slice(buf);
+                self.pos = end as u64;
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Seek for WriteOnly {
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                let new_pos = match pos {
+                    SeekFrom::Start(n) => n as i64,
+                    SeekFrom::End(n) => self.data.len() as i64 + n,
+                    SeekFrom::Current(n) => self.pos as i64 + n,
+                };
+                self.pos = new_pos as u64;
+                Ok(self.pos)
+            }
+        }
+
+        let mut backend = WriteOnly {
+            data: vec![0xff; 1024],
+            pos: 0,
+        };
+        {
+            let mut io = SectorIo::new(&mut backend, 512);
+            io.write_all(&[0xEB, 0x58, 0x90]).unwrap();
+        }
+        assert_eq!(&backend.data[..3], &[0xEB, 0x58, 0x90]);
+        assert_eq!(backend.data[3], 0);
     }
 
     #[test]
