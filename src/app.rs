@@ -20,7 +20,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, WindowExt};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Theme, ThemeMode, WindowExt};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
@@ -110,11 +110,20 @@ pub struct App {
     _subscriptions: Vec<Subscription>,
 }
 
+pub(crate) fn app_theme_mode() -> ThemeMode {
+    ThemeMode::Dark
+}
+
+pub(crate) fn apply_app_theme(cx: &mut gpui_kit::App) {
+    Theme::change(app_theme_mode(), None, cx);
+}
+
 pub fn run() {
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {
             gpui_kit::init(cx);
+            apply_app_theme(cx);
             gpui_kit::open_window(
                 gpui_kit::WindowOptions {
                     window_bounds: Some(gpui_kit::WindowBounds::centered(
@@ -1035,4 +1044,12 @@ fn status_labels() {
     assert_eq!(DriveStatus::Copying.label(), "Copying");
     assert_eq!(DriveStatus::Verifying.label(), "Verifying");
     assert_eq!(DriveStatus::Passed.label(), "Passed");
+}
+
+#[cfg(test)]
+#[test]
+fn theme_starts_dark() {
+    use gpui_kit::component::ThemeMode;
+
+    assert_eq!(app_theme_mode(), ThemeMode::Dark);
 }
