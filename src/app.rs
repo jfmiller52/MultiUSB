@@ -16,7 +16,6 @@ use futures::StreamExt;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::form::{Field, Form};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::scroll::ScrollableElement;
@@ -623,54 +622,105 @@ impl Render for App {
         column = column.child(self.settings_strip(locked, cx));
 
         if !self.runs.is_empty() {
-            column = column.child(self.total_progress_block());
+            column = column.child(self.total_progress_block(cx));
         }
 
-        column = column.child(
-            h_flex()
-                .id("disk-log-split")
-                .w_full()
-                .flex_1()
-                .gap_3()
-                .min_h(px(280.))
+        let show_log = !self.ui.log.is_empty() || self.phase != Phase::Idle;
+        let mut stage = h_flex()
+            .id("disk-log-split")
+            .w_full()
+            .flex_1()
+            .gap_3()
+            .min_h(px(280.))
+            .child(
+                v_flex()
+                    .id("disks-pane")
+                    .flex_1()
+                    .min_w_0()
+                    .gap_2()
+                    .p_3()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded(cx.theme().radius)
+                    .bg(cx.theme().secondary)
+                    .child(self.disk_list(locked, cx)),
+            );
+        if show_log {
+            stage = stage.child(
+                v_flex()
+                    .id("log-pane")
+                    .w(px(280.))
+                    .min_w(px(220.))
+                    .max_w(px(340.))
+                    .gap_2()
+                    .p_3()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded(cx.theme().radius)
+                    .bg(cx.theme().secondary)
+                    .child(self.log_block(cx)),
+            );
+        }
+        column = column.child(stage);
+
+        let checked = self.ui.rows.iter().filter(|row| row.checked).count();
+        let footer_status = if self.phase != Phase::Idle {
+            format!(
+                "{} disk{} in progress",
+                self.runs.len(),
+                if self.runs.len() == 1 { "" } else { "s" }
+            )
+        } else if checked > 0 {
+            format!(
+                "{} disk{} selected · will wipe whole disk",
+                checked,
+                if checked == 1 { "" } else { "s" }
+            )
+        } else {
+            "Select removable disks to wipe and copy".to_string()
+        };
+
+        let mut footer = h_flex()
+            .w_full()
+            .justify_between()
+            .items_center()
+            .gap_3()
+            .pt_3()
+            .border_t_1()
+            .border_color(cx.theme().border);
+        footer = footer.child(
+            v_flex()
+                .gap_0()
+                .child(footer_status)
                 .child(
-                    v_flex()
-                        .id("disks-pane")
-                        .flex_1()
-                        .min_w_0()
-                        .gap_2()
-                        .child(self.disk_list(locked, cx)),
-                )
-                .child(
-                    v_flex()
-                        .id("log-pane")
-                        .flex_1()
-                        .min_w_0()
-                        .gap_2()
-                        .child(self.log_block(cx)),
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if self.phase != Phase::Idle {
+                            "Window stays open until copy + verify finish"
+                        } else {
+                            "Run log records model + serial for each selected disk"
+                        }),
                 ),
         );
-
-        let mut footer = h_flex().w_full().justify_between().gap_2();
+        let mut actions = h_flex().gap_2();
+        if self.ui.show_another {
+            actions = actions.child(
+                Button::new("another-batch")
+                    .label("Run another batch")
+                    .on_click(cx.listener(|this, _, _, cx| this.run_another(cx))),
+            );
+        }
         if !locked {
-            footer = footer.child(
+            actions = actions.child(
                 Button::new("start")
                     .primary()
                     .label("Start")
                     .disabled(!self.can_start())
                     .on_click(cx.listener(|this, _, window, cx| this.ask_to_wipe(window, cx))),
             );
-        } else {
-            footer = footer.child(div());
         }
-        if self.ui.show_another {
-            footer = footer.child(
-                Button::new("another-batch")
-                    .label("Run another batch")
-                    .on_click(cx.listener(|this, _, _, cx| this.run_another(cx))),
-            );
-        }
-        column.child(footer)
+        column.child(footer.child(actions))
     }
 }
 
@@ -680,58 +730,83 @@ impl App {
         let label_invalid = self.ui.form.filesystem.is_some_and(|filesystem| {
             validate_label(filesystem, &self.ui.form.label).is_err()
         });
-        Form::new()
+        let muted = cx.theme().muted_foreground;
+
+        h_flex()
+            .id("settings-strip")
+            .w_full()
+            .gap_3()
+            .items_end()
+            .p_3()
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().secondary)
             .child(
-                Field::new().label("Source folder").child(
-                    h_flex()
-                        .gap_2()
-                        .w_full()
-                        .child(
-                            div().flex_1().min_w_0().child(
-                                Input::new(&self.source).disabled(locked),
+                v_flex()
+                    .flex_1()
+                    .min_w(px(180.))
+                    .gap_1()
+                    .child(div().text_sm().text_color(muted).child("Source folder"))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .w_full()
+                            .child(
+                                div().flex_1().min_w_0().child(
+                                    Input::new(&self.source).disabled(locked),
+                                ),
+                            )
+                            .child(
+                                Button::new("browse")
+                                    .label("Browse")
+                                    .disabled(locked)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.browse_source(window, cx);
+                                    })),
                             ),
-                        )
-                        .child(
-                            Button::new("browse")
-                                .label("Browse")
-                                .disabled(locked)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.browse_source(window, cx);
-                                })),
-                        ),
-                ),
+                    ),
             )
             .child(
-                Field::new().label("Filesystem").child(
-                    Select::new(&self.filesystem)
-                        .placeholder("Select filesystem")
-                        .accessibility_label("Filesystem")
-                        .disabled(locked),
-                ),
+                v_flex()
+                    .w(px(150.))
+                    .gap_1()
+                    .child(div().text_sm().text_color(muted).child("Filesystem"))
+                    .child(
+                        Select::new(&self.filesystem)
+                            .placeholder("Select filesystem")
+                            .accessibility_label("Filesystem")
+                            .disabled(locked),
+                    ),
             )
             .child(
-                Field::new().label("Partition type").child(
-                    Select::new(&self.partition)
-                        .placeholder("Select partition type")
-                        .accessibility_label("Partition type")
-                        .disabled(locked),
-                ),
+                v_flex()
+                    .w(px(120.))
+                    .gap_1()
+                    .child(div().text_sm().text_color(muted).child("Partition"))
+                    .child(
+                        Select::new(&self.partition)
+                            .placeholder("Select partition type")
+                            .accessibility_label("Partition type")
+                            .disabled(locked),
+                    ),
             )
             .child(
-                Field::new().label("Volume label").child(
-                    v_flex().gap_1().w_full().child(
-                        Input::new(&self.label).disabled(locked),
-                    ).child(
+                v_flex()
+                    .w(px(150.))
+                    .gap_1()
+                    .child(div().text_sm().text_color(muted).child("Volume label"))
+                    .child(Input::new(&self.label).disabled(locked))
+                    .child(
                         div()
                             .text_sm()
                             .text_color(if label_invalid {
                                 cx.theme().danger
                             } else {
-                                cx.theme().muted_foreground
+                                muted
                             })
                             .child(label_note),
                     ),
-                ),
             )
     }
 
@@ -832,28 +907,50 @@ impl App {
         }
     }
 
-    fn total_progress_block(&self) -> impl IntoElement {
+    fn total_progress_block(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let fraction = self.total_progress_fraction();
-        let caption = if self.phase == Phase::Preparing {
-            format!(
-                "{} of {} disks prepared",
-                self.prepared_done,
-                self.runs.len()
+        let (caption, detail) = if self.phase == Phase::Preparing {
+            (
+                "Total progress".to_string(),
+                format!(
+                    "{} of {} disks prepared",
+                    self.prepared_done,
+                    self.runs.len()
+                ),
             )
         } else {
-            "Total progress".to_string()
+            (
+                "Total progress".to_string(),
+                "Formatting finished · copying selected disks concurrently".to_string(),
+            )
         };
         v_flex()
             .gap_2()
             .w_full()
+            .p_3()
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().secondary)
             .child(
                 h_flex()
                     .justify_between()
                     .w_full()
                     .child(caption)
-                    .child(format!("{:.0}%", fraction * 100.0)),
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{:.0}%", fraction * 100.0)),
+                    ),
             )
             .child(Progress::new("overall").value(fraction * 100.0))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(detail),
+            )
     }
 
     fn log_block(&self, cx: &mut Context<Self>) -> impl IntoElement {
