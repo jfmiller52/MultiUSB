@@ -264,25 +264,50 @@ fn format_large_fat32_volume(
     }
 }
 
+/// Rufus-style access window (`DRIVE_ACCESS_TIMEOUT` / `DRIVE_ACCESS_RETRIES`).
 #[cfg(windows)]
-fn open_shared_rw(path: &str) -> Result<std::fs::File, String> {
+const DRIVE_ACCESS_TIMEOUT_MS: u64 = 15_000;
+#[cfg(windows)]
+const DRIVE_ACCESS_RETRIES: u32 = 150;
+
+/// Open a volume or physical drive for write.
+///
+/// Mirrors Rufus `GetHandle`: prefer exclusive write (`FILE_SHARE_READ` only) so
+/// Explorer and other writers stay out; after ~1/3 of the retry window, escalate
+/// to `FILE_SHARE_WRITE` on sharing/access failures. Always keep `FILE_SHARE_READ`.
+#[cfg(windows)]
+fn open_device_rw(path: &str) -> Result<std::fs::File, String> {
     use std::fs::OpenOptions;
     use std::os::windows::fs::OpenOptionsExt;
     use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
+    let sleep_ms = DRIVE_ACCESS_TIMEOUT_MS / u64::from(DRIVE_ACCESS_RETRIES);
+    let mut share_write = false;
     let mut last_err = None;
-    for attempt in 0..10 {
+    for attempt in 0..DRIVE_ACCESS_RETRIES {
+        let share = FILE_SHARE_READ.0 | if share_write { FILE_SHARE_WRITE.0 } else { 0 };
         match OpenOptions::new()
             .read(true)
             .write(true)
-            .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
+            .share_mode(share)
             .open(path)
         {
             Ok(file) => return Ok(file),
             Err(err) => {
+                let code = err.raw_os_error();
                 last_err = Some(err);
-                if attempt + 1 < 10 {
-                    std::thread::sleep(std::time::Duration::from_millis(200));
+                // ERROR_SHARING_VIOLATION (32), ERROR_ACCESS_DENIED (5),
+                // ERROR_FILE_NOT_FOUND (2) / ERROR_PATH_NOT_FOUND (3) while
+                // Windows finishes mounting after `assign letter=`.
+                let retryable = matches!(code, Some(2 | 3 | 5 | 32));
+                if !retryable {
+                    break;
+                }
+                if !share_write && attempt > DRIVE_ACCESS_RETRIES / 3 {
+                    share_write = true;
+                }
+                if attempt + 1 < DRIVE_ACCESS_RETRIES {
+                    std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
                 }
             }
         }
@@ -292,6 +317,60 @@ fn open_shared_rw(path: &str) -> Result<std::fs::File, String> {
         last_err
             .map(|err| err.to_string())
             .unwrap_or_else(|| "device did not appear".to_string())
+    ))
+}
+
+#[cfg(windows)]
+fn allow_extended_dasd_io(handle: windows::Win32::Foundation::HANDLE) {
+    use windows::Win32::System::IO::DeviceIoControl;
+    use windows::Win32::System::Ioctl::FSCTL_ALLOW_EXTENDED_DASD_IO;
+    // Best-effort: Rufus ignores failure. Disables end-of-volume boundary checks
+    // that can reject format writes near the last sectors.
+    unsafe {
+        let _ = DeviceIoControl(
+            handle,
+            FSCTL_ALLOW_EXTENDED_DASD_IO,
+            None,
+            0,
+            None,
+            0,
+            None,
+            None,
+        );
+    }
+}
+
+#[cfg(windows)]
+fn lock_volume_with_retries(
+    handle: windows::Win32::Foundation::HANDLE,
+    path: &str,
+) -> Result<(), String> {
+    use std::time::{Duration, Instant};
+    use windows::Win32::System::IO::DeviceIoControl;
+    use windows::Win32::System::Ioctl::FSCTL_LOCK_VOLUME;
+
+    let sleep_ms = DRIVE_ACCESS_TIMEOUT_MS / u64::from(DRIVE_ACCESS_RETRIES);
+    let deadline = Instant::now() + Duration::from_millis(DRIVE_ACCESS_TIMEOUT_MS);
+    let mut last_err = None;
+    loop {
+        match unsafe {
+            DeviceIoControl(handle, FSCTL_LOCK_VOLUME, None, 0, None, 0, None, None)
+        } {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = Some(err);
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(sleep_ms));
+            }
+        }
+    }
+    Err(format!(
+        "lock {path}: {}",
+        last_err
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "timed out".to_string())
     ))
 }
 
@@ -356,17 +435,18 @@ fn format_large_fat32_volume_windows(
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::IO::DeviceIoControl;
-    use windows::Win32::System::Ioctl::{
-        FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME, FSCTL_UNLOCK_VOLUME,
-    };
+    use windows::Win32::System::Ioctl::{FSCTL_DISMOUNT_VOLUME, FSCTL_UNLOCK_VOLUME};
 
     let physical_path = format!(r"\\.\PhysicalDrive{disk_number}");
     let volume_path = format!(r"\\.\{letter}:");
 
-    // Hold the volume locked+dismounted so Windows cannot remount while we write
-    // the filesystem through the physical disk at the partition offset. Writing
-    // via `\\.\X:` after diskpart assign has been unreliable (os error 433).
-    let volume = open_shared_rw(&volume_path)?;
+    // Rufus FormatLargeFAT32 sequence on the logical volume:
+    //   open (exclusive write preferred) → ALLOW_EXTENDED_DASD_IO →
+    //   LOCK_VOLUME (retried) → DISMOUNT_VOLUME → write sectors.
+    // We keep that volume guard, then write through PhysicalDrive at the
+    // partition offset because post-diskpart `\\.\X:` writes have failed with
+    // os error 433 on real USB sticks even after lock.
+    let volume = open_device_rw(&volume_path)?;
     let volume_handle = HANDLE(volume.as_raw_handle());
     let unlock = || unsafe {
         let _ = DeviceIoControl(
@@ -380,19 +460,15 @@ fn format_large_fat32_volume_windows(
             None,
         );
     };
+
+    allow_extended_dasd_io(volume_handle);
+    if let Err(err) = lock_volume_with_retries(volume_handle, &volume_path) {
+        unlock();
+        return Err(err);
+    }
+    // Rufus ignores dismount failure and continues; lock is the hard requirement.
     unsafe {
-        DeviceIoControl(
-            volume_handle,
-            FSCTL_LOCK_VOLUME,
-            None,
-            0,
-            None,
-            0,
-            None,
-            None,
-        )
-        .map_err(|err| format!("lock {volume_path}: {err}"))?;
-        DeviceIoControl(
+        let _ = DeviceIoControl(
             volume_handle,
             FSCTL_DISMOUNT_VOLUME,
             None,
@@ -401,14 +477,10 @@ fn format_large_fat32_volume_windows(
             0,
             None,
             None,
-        )
-        .map_err(|err| {
-            unlock();
-            format!("dismount {volume_path}: {err}")
-        })?;
+        );
     }
 
-    let physical = match open_shared_rw(&physical_path) {
+    let physical = match open_device_rw(&physical_path) {
         Ok(file) => file,
         Err(err) => {
             unlock();
