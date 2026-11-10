@@ -93,6 +93,17 @@ pub fn overall_fraction(bytes_copied: &[u64], source_bytes: u64) -> f32 {
     sum as f32 / total as f32
 }
 
+pub fn serial_text(serial: Option<&str>) -> String {
+    match serial.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => format!("S/N {value}"),
+        None => "S/N unavailable".to_string(),
+    }
+}
+
+pub fn disk_log_name(number: u32, model: &str, serial: Option<&str>) -> String {
+    format!("Disk {number} ({model}) · {}", serial_text(serial))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +225,24 @@ mod tests {
         assert!((overall_fraction(&[50, 100], 100) - 0.75).abs() < f32::EPSILON);
         assert_eq!(overall_fraction(&[], 100), 0.0);
         assert_eq!(overall_fraction(&[10], 0), 0.0);
+    }
+
+    #[test]
+    fn serial_text_uses_value_or_unavailable() {
+        assert_eq!(serial_text(Some("ABC123")), "S/N ABC123");
+        assert_eq!(serial_text(Some("  ")), "S/N unavailable");
+        assert_eq!(serial_text(None), "S/N unavailable");
+    }
+
+    #[test]
+    fn disk_log_name_includes_serial_text() {
+        assert_eq!(
+            disk_log_name(1, "SanDisk", Some("ABC123")),
+            "Disk 1 (SanDisk) · S/N ABC123"
+        );
+        assert_eq!(
+            disk_log_name(2, "Kingston", None),
+            "Disk 2 (Kingston) · S/N unavailable"
+        );
     }
 }
