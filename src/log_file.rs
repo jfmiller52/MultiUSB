@@ -16,6 +16,12 @@ pub fn write_run_log(cwd: &Path, stamp: &str, lines: &[String]) -> io::Result<Pa
     Ok(path)
 }
 
+/// Best-effort FAT32 format failure dump under `Logs/fat32-trace-*.log`.
+pub fn write_fat32_trace(cwd: &Path, lines: &[String]) -> io::Result<PathBuf> {
+    let stamp = chrono::Local::now().format("fat32-trace-%Y-%m-%d_%H-%M-%S");
+    write_run_log(cwd, &stamp.to_string(), lines)
+}
+
 fn unique_log_path(logs_dir: &Path, stamp: &str) -> io::Result<PathBuf> {
     let base = logs_dir.join(format!("{stamp}.log"));
     if !base.exists() {
@@ -56,6 +62,15 @@ mod tests {
         assert_eq!(
             path2,
             base.join("Logs").join("2026-11-09_13-04-00-2.log")
+        );
+
+        let trace_path = write_fat32_trace(&base, &lines).unwrap();
+        assert!(
+            trace_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("fat32-trace-") && name.ends_with(".log")),
+            "unexpected trace path {trace_path:?}"
         );
 
         let _ = fs::remove_dir_all(&base);

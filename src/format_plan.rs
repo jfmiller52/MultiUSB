@@ -5,7 +5,8 @@ pub const FAT32_MAX_INCLUSIVE_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreparePlan {
     Script(String),
-    /// FAT32 above Windows' diskpart limit: wipe/partition/assign only, then in-process format.
+    /// FAT32 above Windows' diskpart limit: wipe/partition only (no letter), then
+    /// in-process format and a single letter assign afterward.
     BuiltInFat32 { script: String },
 }
 
@@ -16,17 +17,36 @@ fn convert_token(style: PartitionStyle) -> &'static str {
     }
 }
 
+fn disk_prep_prefix(disk_number: u32) -> String {
+    // online + clear readonly: USB sticks left offline/RO after failed formats
+    // otherwise fail `clean`. `noerr` is required — `online disk` returns a
+    // Virtual Disk Service error when already online. Re-select after `clean`:
+    // cleaning clears the current disk selection on this host.
+    format!(
+        "rescan\r\nselect disk {disk_number}\r\nonline disk noerr\r\nattributes disk clear readonly noerr\r\nclean\r\nselect disk {disk_number}\r\n"
+    )
+}
+
 fn build_script(disk_number: u32, style: PartitionStyle, format_line: &str) -> String {
     let convert = convert_token(style);
     format!(
-        "rescan\r\nselect disk {disk_number}\r\nclean\r\nconvert {convert}\r\ncreate partition primary\r\n{format_line}\r\nassign\r\nexit\r\n"
+        "{}convert {convert}\r\ncreate partition primary\r\n{format_line}\r\nassign\r\nexit\r\n",
+        disk_prep_prefix(disk_number)
     )
 }
 
 fn build_assign_only_script(disk_number: u32, style: PartitionStyle) -> String {
     let convert = convert_token(style);
+    // MBR: create as FAT32 LBA (0x0C). Do not assign a letter yet — mounting a
+    // RAW partition makes Explorer AutoPlay "There's a problem with this drive"
+    // and thrash the volume while we format.
+    let create = match style {
+        PartitionStyle::Mbr => "create partition primary id=0c",
+        PartitionStyle::Gpt => "create partition primary",
+    };
     format!(
-        "rescan\r\nselect disk {disk_number}\r\nclean\r\nconvert {convert}\r\ncreate partition primary\r\nassign\r\nexit\r\n"
+        "{}convert {convert}\r\n{create}\r\nexit\r\n",
+        disk_prep_prefix(disk_number)
     )
 }
 
@@ -62,13 +82,18 @@ mod tests {
 
     fn script(disk: u32, convert: &str, format_line: &str) -> String {
         format!(
-            "rescan\r\nselect disk {disk}\r\nclean\r\nconvert {convert}\r\ncreate partition primary\r\n{format_line}\r\nassign\r\nexit\r\n"
+            "rescan\r\nselect disk {disk}\r\nonline disk noerr\r\nattributes disk clear readonly noerr\r\nclean\r\nselect disk {disk}\r\nconvert {convert}\r\ncreate partition primary\r\n{format_line}\r\nassign\r\nexit\r\n"
         )
     }
 
     fn assign_only_script(disk: u32, convert: &str) -> String {
+        let create = if convert == "mbr" {
+            "create partition primary id=0c"
+        } else {
+            "create partition primary"
+        };
         format!(
-            "rescan\r\nselect disk {disk}\r\nclean\r\nconvert {convert}\r\ncreate partition primary\r\nassign\r\nexit\r\n"
+            "rescan\r\nselect disk {disk}\r\nonline disk noerr\r\nattributes disk clear readonly noerr\r\nclean\r\nselect disk {disk}\r\nconvert {convert}\r\n{create}\r\nexit\r\n"
         )
     }
 

@@ -15,7 +15,11 @@ pub const COPY_RETRY: RetryPolicy = RetryPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CopyError {
-    File { path: PathBuf, attempts: u32 },
+    File {
+        path: PathBuf,
+        attempts: u32,
+        detail: String,
+    },
 }
 
 pub use crate::long_path::extended_path;
@@ -42,6 +46,7 @@ pub fn copy_tree(
                     let _ = std::fs::create_dir_all(extended_path(parent));
                 }
                 let mut copied = false;
+                let mut last_detail = String::new();
                 for attempt in 1..=policy.attempts {
                     match std::fs::copy(extended_path(&src), extended_path(&dest)) {
                         Ok(bytes) => {
@@ -50,14 +55,19 @@ pub fn copy_tree(
                             copied = true;
                             break;
                         }
-                        Err(_) if attempt < policy.attempts => sleep(policy.wait),
-                        Err(_) => {}
+                        Err(err) => {
+                            last_detail = err.to_string();
+                            if attempt < policy.attempts {
+                                sleep(policy.wait);
+                            }
+                        }
                     }
                 }
                 if !copied {
                     return Err(CopyError::File {
                         path: entry.relative.clone(),
                         attempts: policy.attempts,
+                        detail: last_detail,
                     });
                 }
             }

@@ -1,8 +1,10 @@
+pub mod autoplay;
 pub mod commands;
 pub mod disk_id;
 pub mod copy;
 pub mod label;
 pub mod format_plan;
+mod format_fat32;
 pub mod log_file;
 mod long_path;
 pub mod session;

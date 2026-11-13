@@ -224,8 +224,8 @@ fn finish_script(
         Err(_) => return (Err(PrepareFailure::NoLetter), None),
     };
     let script = with_assign_letter(script, letter);
-    if host.diskpart(&script).is_err() {
-        return (Err(PrepareFailure::Diskpart), None);
+    if let Err(message) = host.diskpart(&script) {
+        return (Err(PrepareFailure::Command(format!("diskpart: {message}"))), None);
     }
     let cleaned = Some(cleaned_disk(disk));
     (Ok(prepared_disk(disk, letter)), cleaned)
@@ -241,9 +241,13 @@ fn finish_builtin_fat32(
         Ok(letter) => letter,
         Err(_) => return (Err(PrepareFailure::NoLetter), None),
     };
-    let script = with_assign_letter(script, letter);
-    if host.diskpart(&script).is_err() {
-        return (Err(PrepareFailure::Diskpart), None);
+    // Script intentionally has no `assign` — letter is applied after format so
+    // Explorer never mounts a RAW partition.
+    if let Err(message) = host.diskpart(script) {
+        return (
+            Err(PrepareFailure::Command(format!("diskpart: {message}"))),
+            None,
+        );
     }
     let cleaned = Some(cleaned_disk(disk));
     if let Err(message) = host.format_large_fat32(disk.number, letter, label) {
@@ -332,8 +336,15 @@ fn drive_outcome(
             on_bytes(index, total, source_total);
         },
     ) {
-        Err(CopyError::File { path, attempts }) => DriveOutcome::Failed {
-            reason: format!("Copy failed after {attempts} tries: {}", path.display()),
+        Err(CopyError::File {
+            path,
+            attempts,
+            detail,
+        }) => DriveOutcome::Failed {
+            reason: format!(
+                "Copy failed after {attempts} tries: {} ({detail})",
+                path.display()
+            ),
         },
         Ok(_) => verify_copied(target),
     }
@@ -546,18 +557,34 @@ mod tests {
 
     fn diskpart_script(number: u32, convert: &str, format_line: &str) -> String {
         format!(
-            "rescan\r\nselect disk {number}\r\nclean\r\nconvert {convert}\r\ncreate partition primary\r\n{format_line}\r\nassign\r\nexit\r\n"
+            "rescan\r\nselect disk {number}\r\nonline disk noerr\r\nattributes disk clear readonly noerr\r\nclean\r\nselect disk {number}\r\nconvert {convert}\r\ncreate partition primary\r\n{format_line}\r\nassign\r\nexit\r\n"
         )
     }
 
     fn assign_only_script(number: u32, convert: &str) -> String {
+        let create = if convert == "mbr" {
+            "create partition primary id=0c"
+        } else {
+            "create partition primary"
+        };
         format!(
-            "rescan\r\nselect disk {number}\r\nclean\r\nconvert {convert}\r\ncreate partition primary\r\nassign\r\nexit\r\n"
+            "rescan\r\nselect disk {number}\r\nonline disk noerr\r\nattributes disk clear readonly noerr\r\nclean\r\nselect disk {number}\r\nconvert {convert}\r\n{create}\r\nexit\r\n"
         )
     }
 
+    fn wipe_only_script(number: u32, convert: &str) -> String {
+        assign_only_script(number, convert)
+    }
+
     fn assign_letter_script(number: u32, convert: &str, letter: char) -> String {
-        with_assign_letter(&assign_only_script(number, convert), letter)
+        let create = if convert == "mbr" {
+            "create partition primary id=0c"
+        } else {
+            "create partition primary"
+        };
+        format!(
+            "rescan\r\nselect disk {number}\r\nonline disk noerr\r\nattributes disk clear readonly noerr\r\nclean\r\nselect disk {number}\r\nconvert {convert}\r\n{create}\r\nassign letter={letter}\r\nexit\r\n"
+        )
     }
 
     fn format_assign_letter_script(
@@ -687,7 +714,7 @@ mod tests {
         assert_eq!(
             host.scripts,
             vec![
-                assign_letter_script(2, "gpt", 'E'),
+                wipe_only_script(2, "gpt"),
                 format_assign_letter_script(
                     3,
                     "gpt",
@@ -732,7 +759,10 @@ mod tests {
 
         match result {
             PrepareAll::Done(results) => {
-                assert!(matches!(results[0], Err(PrepareFailure::Diskpart)));
+                assert!(matches!(
+                    &results[0],
+                    Err(PrepareFailure::Command(message)) if message.starts_with("diskpart:")
+                ));
                 assert!(matches!(
                     &results[1],
                     Ok(prepared) if prepared.letter == 'H' && prepared.model == "Two"
@@ -835,7 +865,7 @@ mod tests {
             },
             PrepareAll::AbortSystemDisk { .. } => panic!("expected the disk to finish"),
         }
-        assert_eq!(host.scripts, vec![assign_letter_script(4, "gpt", 'E')]);
+        assert_eq!(host.scripts, vec![wipe_only_script(4, "gpt")]);
         assert_eq!(host.format_calls, vec![(4, 'E', "STORE".to_string())]);
         assert!(host.commands.is_empty());
     }
@@ -876,10 +906,7 @@ mod tests {
         }
         assert_eq!(
             host.scripts,
-            vec![
-                assign_letter_script(4, "gpt", 'E'),
-                assign_letter_script(5, "gpt", 'F')
-            ]
+            vec![wipe_only_script(4, "gpt"), wipe_only_script(5, "gpt")]
         );
         assert_eq!(
             host.format_calls,
@@ -1230,8 +1257,12 @@ mod tests {
 
     #[test]
     fn with_assign_letter_rewrites_diskpart_assign_line() {
+        let with_assign = format!(
+            "{}assign\r\nexit\r\n",
+            wipe_only_script(4, "gpt").trim_end_matches("exit\r\n")
+        );
         assert_eq!(
-            with_assign_letter(&assign_only_script(4, "gpt"), 'E'),
+            with_assign_letter(&with_assign, 'E'),
             assign_letter_script(4, "gpt", 'E')
         );
     }

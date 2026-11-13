@@ -122,6 +122,7 @@ pub(crate) fn apply_app_theme(cx: &mut gpui_kit::App) {
 }
 
 pub fn run() {
+    crate::autoplay::restore_pending();
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {
@@ -236,7 +237,7 @@ impl App {
                 });
             }
             if close {
-                std::process::exit(0);
+                crate::autoplay::exit(0);
             }
             false
         });
@@ -592,7 +593,7 @@ impl App {
         self.ui.show_another = true;
         self.phase = Phase::Done;
         if self.gate.is_requested() {
-            std::process::exit(0);
+            crate::autoplay::exit(0);
         }
     }
 }
@@ -1056,6 +1057,7 @@ fn spawn_job(
 ) {
     std::thread::spawn(move || {
         install_close_panic_hook();
+        let _autoplay = crate::autoplay::AutoplayGuard::disable();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_batch(
                 selected,
@@ -1069,7 +1071,7 @@ fn spawn_job(
             );
         }));
         if gate.is_requested() {
-            std::process::exit(0);
+            crate::autoplay::exit(0);
         }
         if result.is_err() {
             send_event(&tx, JobEvent::Crashed);
