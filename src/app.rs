@@ -11,7 +11,9 @@ use crate::session::{
     start_enabled,
 };
 use crate::source::{EntryKind, SourceEntry, walk_source};
-use crate::windows_host::{CloseGate, WindowsHost, is_elevated, relaunch_elevated};
+use crate::windows_host::{
+    CloseGate, WindowsCopyGuard, WindowsHost, is_elevated, relaunch_elevated,
+};
 use futures::StreamExt;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
@@ -25,7 +27,7 @@ use gpui_kit::component::{ActiveTheme as _, Disableable as _, Theme, ThemeMode, 
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, SharedString, Styled as _, Subscription, Task, Window, div, px,
+    PathPromptOptions, Render, SharedString, Styled as _, Subscription, Task, Window, div, px,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Once};
@@ -308,12 +310,40 @@ impl App {
         if self.locked() {
             return;
         }
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Source folder")
-            .pick_folder()
-        else {
+        // The picker must not block inside this handler. A native modal loop run
+        // from here lets other GPUI tasks start while the app is still borrowed
+        // by this click, and that double borrow aborts the process.
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let picked = match picked.await {
+                Ok(Ok(Some(paths))) => Ok(paths.into_iter().next()),
+                Ok(Ok(None)) | Err(_) => Ok(None),
+                Ok(Err(err)) => Err(err.to_string()),
+            };
+            this.update_in(cx, |this, window, cx| match picked {
+                Ok(Some(path)) => this.set_source(path, window, cx),
+                Ok(None) => {}
+                Err(err) => {
+                    this.ui
+                        .log
+                        .push(format!("Folder picker could not be opened: {err}"));
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn set_source(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.locked() {
             return;
-        };
+        }
         let shown = path.display().to_string();
         self.ui.form.source = Some(path);
         self.source.update(cx, |state, cx| {
@@ -495,7 +525,7 @@ impl App {
                         continue;
                     };
                     match result {
-                        Ok(_) => {
+                        Ok(prepared) => {
                             run.reached_copy = true;
                             run.copy_slot = Some(slot);
                             slot += 1;
@@ -505,7 +535,9 @@ impl App {
                             } else {
                                 DriveStatus::Ready
                             };
-                            prepare_logs.push((run.row_index, "Prepared".to_string()));
+                            for line in prepared_log_lines(prepared.note.as_deref()) {
+                                prepare_logs.push((run.row_index, line));
+                            }
                         }
                         Err(failure) => {
                             run.status = DriveStatus::Failed;
@@ -1146,7 +1178,7 @@ fn run_batch(
                         },
                     );
                 };
-                copy_and_verify_all(targets, &on_enter, &on_bytes)
+                copy_and_verify_all(targets, &WindowsCopyGuard, &on_enter, &on_bytes)
             };
             send_event(tx, JobEvent::Finished(outcomes));
         }
@@ -1181,6 +1213,13 @@ fn stop_copy_if_closed(gate: &CloseGate) {
 fn send_event(tx: &Mutex<futures::channel::mpsc::UnboundedSender<JobEvent>>, event: JobEvent) {
     let sender = tx.lock().unwrap_or_else(|err| err.into_inner());
     let _ = sender.unbounded_send(event);
+}
+
+/// Run-log lines for a disk that finished the prepare step.
+fn prepared_log_lines(note: Option<&str>) -> Vec<String> {
+    let mut lines: Vec<String> = note.map(str::to_string).into_iter().collect();
+    lines.push("Prepared".to_string());
+    lines
 }
 
 fn prepare_reason(failure: &PrepareFailure) -> String {
@@ -1299,6 +1338,19 @@ fn status_labels() {
     assert_eq!(DriveStatus::Copying.label(), "Copying");
     assert_eq!(DriveStatus::Verifying.label(), "Verifying");
     assert_eq!(DriveStatus::Passed.label(), "Passed");
+}
+
+#[cfg(test)]
+#[test]
+fn prepared_log_lines_put_the_format_note_before_prepared() {
+    assert_eq!(prepared_log_lines(None), vec!["Prepared".to_string()]);
+    assert_eq!(
+        prepared_log_lines(Some("FAT32 format path: locked volume (Ridgecrop method)")),
+        vec![
+            "FAT32 format path: locked volume (Ridgecrop method)".to_string(),
+            "Prepared".to_string(),
+        ]
+    );
 }
 
 #[cfg(test)]

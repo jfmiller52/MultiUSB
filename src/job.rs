@@ -5,7 +5,7 @@ use crate::format_plan::{PreparePlan, prepare_plan};
 use crate::label::{Filesystem, PartitionStyle};
 use crate::source::{EntryKind, SourceEntry};
 use crate::verify::{mismatch_summary, verify_tree};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub trait VolumeHost {
     fn list_all(&mut self) -> Result<Vec<EnumeratedDisk>, String>;
@@ -14,13 +14,26 @@ pub trait VolumeHost {
     /// Next unused drive letter (D–Z) for an explicit `diskpart assign letter=`.
     fn free_drive_letter(&mut self) -> Result<char, String>;
     fn run_command(&mut self, cmd: &ExternalCommand) -> Result<(), String>;
+    /// On success, returns one line for the run log naming the format path used.
     fn format_large_fat32(
         &mut self,
         disk_number: u32,
         letter: char,
         label: &str,
-    ) -> Result<(), String>;
+    ) -> Result<String, String>;
     fn exe_path(&self) -> PathBuf;
+}
+
+/// Confirms that what the copy wrote reached the disk it started on.
+///
+/// Windows reports a file as written once it is in the cache. If the disk
+/// disconnects afterwards the data is lost, yet path and size checks still pass.
+pub trait CopyGuard: Sync {
+    /// Kernel device name behind `dest`. It changes when the disk disconnects
+    /// and reconnects.
+    fn device_identity(&self, dest: &Path) -> Result<String, String>;
+    /// Write everything Windows still holds in cache for `dest` to the disk.
+    fn flush(&self, dest: &Path) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +49,8 @@ pub struct Prepared {
     pub id: DiskId,
     pub letter: char,
     pub model: String,
+    /// Extra run-log line from the prepare step, such as which FAT32 format path ran.
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,19 +256,33 @@ fn finish_builtin_fat32(
         Ok(letter) => letter,
         Err(_) => return (Err(PrepareFailure::NoLetter), None),
     };
-    // Script intentionally has no `assign` — letter is applied after format so
-    // Explorer never mounts a RAW partition.
-    if let Err(message) = host.diskpart(script) {
+    // Ridgecrop needs `\\.\X:` — assign before the in-process format, then lock
+    // the volume exclusively so Explorer cannot thrash the RAW mount.
+    let script = with_assign_letter(script, letter);
+    if let Err(message) = host.diskpart(&script) {
         return (
             Err(PrepareFailure::Command(format!("diskpart: {message}"))),
             None,
         );
     }
     let cleaned = Some(cleaned_disk(disk));
-    if let Err(message) = host.format_large_fat32(disk.number, letter, label) {
-        return (Err(PrepareFailure::Command(message)), cleaned);
+    match host.format_large_fat32(disk.number, letter, label) {
+        Ok(note) => {
+            let mut prepared = prepared_disk(disk, letter);
+            prepared.note = Some(note);
+            (Ok(prepared), cleaned)
+        }
+        Err(message) => (Err(PrepareFailure::Command(message)), cleaned),
     }
-    (Ok(prepared_disk(disk, letter)), cleaned)
+}
+
+fn prepared_disk(disk: &EnumeratedDisk, letter: char) -> Prepared {
+    Prepared {
+        id: disk.id.clone(),
+        letter,
+        model: disk.model.clone(),
+        note: None,
+    }
 }
 
 fn with_assign_letter(script: &str, letter: char) -> String {
@@ -265,14 +294,6 @@ fn cleaned_disk(disk: &EnumeratedDisk) -> CleanedDisk {
         number: disk.number,
         model: disk.model.clone(),
         serial: disk.id.serial.clone(),
-    }
-}
-
-fn prepared_disk(disk: &EnumeratedDisk, letter: char) -> Prepared {
-    Prepared {
-        id: disk.id.clone(),
-        letter,
-        model: disk.model.clone(),
     }
 }
 
@@ -291,6 +312,7 @@ pub enum DriveOutcome {
 
 pub fn copy_and_verify_all(
     targets: Vec<CopyTarget>,
+    guard: &dyn CopyGuard,
     on_enter: &(dyn Fn() + Sync),
     on_bytes: &(dyn Fn(usize, u64, u64) + Sync),
 ) -> Vec<DriveOutcome> {
@@ -299,7 +321,7 @@ pub fn copy_and_verify_all(
         for (index, target) in targets.into_iter().enumerate() {
             handles.push(scope.spawn(move || {
                 on_enter();
-                drive_outcome(index, &target, on_bytes)
+                drive_outcome(index, &target, guard, on_bytes)
             }));
         }
         handles
@@ -315,8 +337,17 @@ pub fn copy_and_verify_all(
 fn drive_outcome(
     index: usize,
     target: &CopyTarget,
+    guard: &dyn CopyGuard,
     on_bytes: &(dyn Fn(usize, u64, u64) + Sync),
 ) -> DriveOutcome {
+    let device_before = match guard.device_identity(&target.dest) {
+        Ok(device) => device,
+        Err(detail) => {
+            return DriveOutcome::Failed {
+                reason: format!("Could not identify the disk before the copy: {detail}"),
+            };
+        }
+    };
     let source_total = target.entries.iter().fold(0u64, |sum, entry| {
         sum + match entry.kind {
             EntryKind::File => entry.size,
@@ -346,7 +377,43 @@ fn drive_outcome(
                 path.display()
             ),
         },
-        Ok(_) => verify_copied(target),
+        Ok(_) => {
+            if let Err(detail) = guard.flush(&target.dest) {
+                return DriveOutcome::Failed {
+                    reason: format!("Flush to disk failed: {detail}"),
+                };
+            }
+            match verify_copied(target) {
+                DriveOutcome::Passed { checked } => {
+                    stayed_connected(guard, target, &device_before, checked)
+                }
+                failed => failed,
+            }
+        }
+    }
+}
+
+/// A disk that disconnected mid-copy loses whatever Windows had not written yet,
+/// even though every file is listed with the right size afterwards.
+fn stayed_connected(
+    guard: &dyn CopyGuard,
+    target: &CopyTarget,
+    device_before: &str,
+    checked: usize,
+) -> DriveOutcome {
+    match guard.device_identity(&target.dest) {
+        Ok(device_after) if device_after == device_before => DriveOutcome::Passed { checked },
+        Ok(device_after) => DriveOutcome::Failed {
+            reason: format!(
+                "The disk disconnected during the copy, so files may be missing or damaged. \
+                 Device was {device_before}, now {device_after}."
+            ),
+        },
+        Err(detail) => DriveOutcome::Failed {
+            reason: format!(
+                "Could not confirm the disk stayed connected during the copy: {detail}"
+            ),
+        },
     }
 }
 
@@ -419,9 +486,58 @@ mod tests {
         format_calls: Vec<(u32, char, String)>,
         format_error: Option<String>,
         format_errors_queue: Vec<String>,
+        format_note: String,
         free_letters: Vec<char>,
         exe: PathBuf,
         log: Arc<Mutex<Vec<Mark>>>,
+    }
+
+    /// Stands in for the Windows device checks: a real disk cannot be made to
+    /// disconnect inside a unit test.
+    struct FakeGuard {
+        /// Answers for successive `device_identity` calls; the last one repeats.
+        identities: Mutex<Vec<Result<String, String>>>,
+        flush_result: Result<(), String>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl FakeGuard {
+        fn steady() -> Self {
+            Self::with_identities(vec![Ok(r"\Device\Harddisk1\DR81".to_string())])
+        }
+
+        fn with_identities(identities: Vec<Result<String, String>>) -> Self {
+            Self {
+                identities: Mutex::new(identities),
+                flush_result: Ok(()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("calls").clone()
+        }
+    }
+
+    impl CopyGuard for FakeGuard {
+        fn device_identity(&self, _dest: &Path) -> Result<String, String> {
+            self.calls.lock().expect("calls").push("identity".to_string());
+            let mut identities = self.identities.lock().expect("identities");
+            if identities.len() > 1 {
+                identities.remove(0)
+            } else {
+                identities[0].clone()
+            }
+        }
+
+        fn flush(&self, dest: &Path) -> Result<(), String> {
+            let copied = dest.join("a.txt").exists();
+            self.calls
+                .lock()
+                .expect("calls")
+                .push(format!("flush copied={copied}"));
+            self.flush_result.clone()
+        }
     }
 
     impl FakeHost {
@@ -437,6 +553,7 @@ mod tests {
                 format_calls: Vec::new(),
                 format_error: None,
                 format_errors_queue: Vec::new(),
+                format_note: "FAT32 format path: test".to_string(),
                 free_letters: Vec::new(),
                 exe: PathBuf::from(r"C:\MultiUSBTest\MultiUSB.exe"),
                 log: Arc::new(Mutex::new(Vec::new())),
@@ -507,7 +624,7 @@ mod tests {
             disk_number: u32,
             letter: char,
             label: &str,
-        ) -> Result<(), String> {
+        ) -> Result<String, String> {
             self.format_calls
                 .push((disk_number, letter, label.to_string()));
             if !self.format_errors_queue.is_empty() {
@@ -515,7 +632,7 @@ mod tests {
             }
             match &self.format_error {
                 Some(message) => Err(message.clone()),
-                None => Ok(()),
+                None => Ok(self.format_note.clone()),
             }
         }
 
@@ -568,12 +685,16 @@ mod tests {
             "create partition primary"
         };
         format!(
-            "rescan\r\nselect disk {number}\r\nonline disk noerr\r\nattributes disk clear readonly noerr\r\nclean\r\nselect disk {number}\r\nconvert {convert}\r\n{create}\r\nexit\r\n"
+            "rescan\r\nselect disk {number}\r\nonline disk noerr\r\nattributes disk clear readonly noerr\r\nclean\r\nselect disk {number}\r\nconvert {convert}\r\n{create}\r\nassign\r\nexit\r\n"
         )
     }
 
     fn wipe_only_script(number: u32, convert: &str) -> String {
         assign_only_script(number, convert)
+    }
+
+    fn wipe_and_assign_script(number: u32, convert: &str, letter: char) -> String {
+        with_assign_letter(&assign_only_script(number, convert), letter)
     }
 
     fn assign_letter_script(number: u32, convert: &str, letter: char) -> String {
@@ -714,7 +835,7 @@ mod tests {
         assert_eq!(
             host.scripts,
             vec![
-                wipe_only_script(2, "gpt"),
+                wipe_and_assign_script(2, "gpt", 'E'),
                 format_assign_letter_script(
                     3,
                     "gpt",
@@ -865,7 +986,7 @@ mod tests {
             },
             PrepareAll::AbortSystemDisk { .. } => panic!("expected the disk to finish"),
         }
-        assert_eq!(host.scripts, vec![wipe_only_script(4, "gpt")]);
+        assert_eq!(host.scripts, vec![wipe_and_assign_script(4, "gpt", 'E')]);
         assert_eq!(host.format_calls, vec![(4, 'E', "STORE".to_string())]);
         assert!(host.commands.is_empty());
     }
@@ -906,7 +1027,10 @@ mod tests {
         }
         assert_eq!(
             host.scripts,
-            vec![wipe_only_script(4, "gpt"), wipe_only_script(5, "gpt")]
+            vec![
+                wipe_and_assign_script(4, "gpt", 'E'),
+                wipe_and_assign_script(5, "gpt", 'F')
+            ]
         );
         assert_eq!(
             host.format_calls,
@@ -1257,12 +1381,8 @@ mod tests {
 
     #[test]
     fn with_assign_letter_rewrites_diskpart_assign_line() {
-        let with_assign = format!(
-            "{}assign\r\nexit\r\n",
-            wipe_only_script(4, "gpt").trim_end_matches("exit\r\n")
-        );
         assert_eq!(
-            with_assign_letter(&with_assign, 'E'),
+            with_assign_letter(&wipe_only_script(4, "gpt"), 'E'),
             assign_letter_script(4, "gpt", 'E')
         );
     }
@@ -1338,7 +1458,8 @@ mod tests {
             bytes_c.lock().expect("bytes").push((index, copied, total));
         };
 
-        let outcomes = copy_and_verify_all(vec![first, second], &on_enter, &on_bytes);
+        let outcomes =
+            copy_and_verify_all(vec![first, second], &FakeGuard::steady(), &on_enter, &on_bytes);
         watcher.join().unwrap();
 
         assert!(
@@ -1377,6 +1498,7 @@ mod tests {
                 dest,
                 entries: walk.entries,
             }],
+            &FakeGuard::steady(),
             &|| {},
             &|index, copied, total| bytes.lock().expect("bytes").push((index, copied, total)),
         );
@@ -1404,7 +1526,8 @@ mod tests {
         };
         let good = one_file(&root, "good", b"ok");
 
-        let outcomes = copy_and_verify_all(vec![bad, good], &|| {}, &|_, _, _| {});
+        let outcomes =
+            copy_and_verify_all(vec![bad, good], &FakeGuard::steady(), &|| {}, &|_, _, _| {});
 
         match &outcomes[0] {
             DriveOutcome::Failed { reason } => {
@@ -1436,6 +1559,7 @@ mod tests {
                     size: 99,
                 }],
             }],
+            &FakeGuard::steady(),
             &|| {},
             &|_, _, _| {},
         );
@@ -1447,5 +1571,139 @@ mod tests {
             }]
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn disk_that_reconnects_during_copy_fails_even_when_files_verify() {
+        let root = scratch("reconnect");
+        let target = one_file(&root, "one", b"ab");
+        let guard = FakeGuard::with_identities(vec![
+            Ok(r"\Device\Harddisk1\DR81".to_string()),
+            Ok(r"\Device\Harddisk1\DR86".to_string()),
+        ]);
+
+        let outcomes = copy_and_verify_all(vec![target], &guard, &|| {}, &|_, _, _| {});
+
+        match &outcomes[0] {
+            DriveOutcome::Failed { reason } => {
+                assert!(
+                    reason.starts_with("The disk disconnected during the copy"),
+                    "{reason}"
+                );
+                assert!(reason.contains("DR81") && reason.contains("DR86"), "{reason}");
+            }
+            DriveOutcome::Passed { .. } => panic!("a reconnected disk must not pass"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn flush_failure_fails_the_drive() {
+        let root = scratch("flush_fail");
+        let target = one_file(&root, "one", b"ab");
+        let mut guard = FakeGuard::steady();
+        guard.flush_result = Err("The device does not exist. (os error 433)".to_string());
+
+        let outcomes = copy_and_verify_all(vec![target], &guard, &|| {}, &|_, _, _| {});
+
+        assert_eq!(
+            outcomes,
+            vec![DriveOutcome::Failed {
+                reason: "Flush to disk failed: The device does not exist. (os error 433)"
+                    .to_string(),
+            }]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn steady_disk_is_flushed_after_the_copy_and_rechecked_at_the_end() {
+        let root = scratch("steady");
+        let target = one_file(&root, "one", b"ab");
+        let guard = FakeGuard::steady();
+
+        let outcomes = copy_and_verify_all(vec![target], &guard, &|| {}, &|_, _, _| {});
+
+        assert_eq!(outcomes, vec![DriveOutcome::Passed { checked: 1 }]);
+        assert_eq!(
+            guard.calls(),
+            vec!["identity", "flush copied=true", "identity"]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn disk_that_cannot_be_identified_is_not_copied() {
+        let root = scratch("no_identity");
+        let target = one_file(&root, "one", b"ab");
+        let dest_file = target.dest.join("a.txt");
+        let guard = FakeGuard::with_identities(vec![Err("no such device".to_string())]);
+
+        let outcomes = copy_and_verify_all(vec![target], &guard, &|| {}, &|_, _, _| {});
+
+        assert_eq!(
+            outcomes,
+            vec![DriveOutcome::Failed {
+                reason: "Could not identify the disk before the copy: no such device".to_string(),
+            }]
+        );
+        assert!(!dest_file.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn disk_that_cannot_be_identified_after_the_copy_fails() {
+        let root = scratch("identity_lost");
+        let target = one_file(&root, "one", b"ab");
+        let guard = FakeGuard::with_identities(vec![
+            Ok(r"\Device\Harddisk1\DR81".to_string()),
+            Err("no such device".to_string()),
+        ]);
+
+        let outcomes = copy_and_verify_all(vec![target], &guard, &|| {}, &|_, _, _| {});
+
+        assert_eq!(
+            outcomes,
+            vec![DriveOutcome::Failed {
+                reason: "Could not confirm the disk stayed connected during the copy: no such device"
+                    .to_string(),
+            }]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn builtin_fat32_format_note_is_kept_on_the_prepared_disk() {
+        let big = removable(2, "Big", "USB\\BIG", FAT32_MAX_INCLUSIVE_BYTES + 1);
+        let small = removable(3, "Small", "USB\\SMALL", 1024);
+        let selected = ids(&[big.clone(), small.clone()]);
+        let mut host = FakeHost::new(vec![Ok(vec![big, small])]);
+        host.free_letter('E');
+        host.free_letter('F');
+        host.format_note = "FAT32 format path: locked volume".to_string();
+        let mut on_prepare = notices(&host);
+
+        let result = prepare_all(
+            &selected,
+            Filesystem::Fat32,
+            PartitionStyle::Gpt,
+            "STORE",
+            &mut host,
+            &mut on_prepare,
+        );
+
+        match result {
+            PrepareAll::Done(results) => {
+                let notes: Vec<Option<String>> = results
+                    .into_iter()
+                    .map(|result| result.expect("both disks prepare").note)
+                    .collect();
+                assert_eq!(
+                    notes,
+                    vec![Some("FAT32 format path: locked volume".to_string()), None]
+                );
+            }
+            PrepareAll::AbortSystemDisk { .. } => panic!("expected both disks to finish"),
+        }
     }
 }

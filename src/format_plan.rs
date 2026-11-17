@@ -5,8 +5,8 @@ pub const FAT32_MAX_INCLUSIVE_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreparePlan {
     Script(String),
-    /// FAT32 above Windows' diskpart limit: wipe/partition only (no letter), then
-    /// in-process format and a single letter assign afterward.
+    /// FAT32 above Windows' diskpart limit: wipe/partition + assign, then
+    /// in-process Ridgecrop-style format on the locked `\\.\X:` volume.
     BuiltInFat32 { script: String },
 }
 
@@ -37,15 +37,15 @@ fn build_script(disk_number: u32, style: PartitionStyle, format_line: &str) -> S
 
 fn build_assign_only_script(disk_number: u32, style: PartitionStyle) -> String {
     let convert = convert_token(style);
-    // MBR: create as FAT32 LBA (0x0C). Do not assign a letter yet — mounting a
-    // RAW partition makes Explorer AutoPlay "There's a problem with this drive"
-    // and thrash the volume while we format.
+    // Ridgecrop/fat32format needs `\\.\X:`, so assign a letter before the
+    // in-process format. AutoplayGuard + exclusive volume lock keep Explorer
+    // from thrashing the RAW mount during the write.
     let create = match style {
         PartitionStyle::Mbr => "create partition primary id=0c",
         PartitionStyle::Gpt => "create partition primary",
     };
     format!(
-        "{}convert {convert}\r\n{create}\r\nexit\r\n",
+        "{}convert {convert}\r\n{create}\r\nassign\r\nexit\r\n",
         disk_prep_prefix(disk_number)
     )
 }
@@ -93,7 +93,7 @@ mod tests {
             "create partition primary"
         };
         format!(
-            "rescan\r\nselect disk {disk}\r\nonline disk noerr\r\nattributes disk clear readonly noerr\r\nclean\r\nselect disk {disk}\r\nconvert {convert}\r\n{create}\r\nexit\r\n"
+            "rescan\r\nselect disk {disk}\r\nonline disk noerr\r\nattributes disk clear readonly noerr\r\nclean\r\nselect disk {disk}\r\nconvert {convert}\r\n{create}\r\nassign\r\nexit\r\n"
         )
     }
 

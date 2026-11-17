@@ -2,7 +2,7 @@ use crate::commands::{
     DISKPART_ATTEMPTS, DISKPART_WAIT, ExternalCommand, parse_all_disk_json,
 };
 use crate::disk_id::{DiskId, EnumeratedDisk};
-use crate::job::VolumeHost;
+use crate::job::{CopyGuard, VolumeHost};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -217,13 +217,151 @@ impl VolumeHost for WindowsHost {
         disk_number: u32,
         letter: char,
         label: &str,
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
         self.stop_if_closed();
         format_large_fat32_volume(disk_number, letter, label)
     }
 
     fn exe_path(&self) -> PathBuf {
         std::env::current_exe().unwrap_or_else(|_| PathBuf::from("MultiUSB.exe"))
+    }
+}
+
+/// Production [`CopyGuard`]: identifies the disk by its kernel device names and
+/// flushes through a volume handle.
+pub struct WindowsCopyGuard;
+
+impl CopyGuard for WindowsCopyGuard {
+    fn device_identity(&self, dest: &Path) -> Result<String, String> {
+        device_identity_for_letter(drive_letter_of(dest)?)
+    }
+
+    fn flush(&self, dest: &Path) -> Result<(), String> {
+        flush_volume(drive_letter_of(dest)?)
+    }
+}
+
+fn drive_letter_of(dest: &Path) -> Result<char, String> {
+    use std::path::{Component, Prefix};
+
+    match dest.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+                Ok(char::from(letter).to_ascii_uppercase())
+            }
+            _ => Err(format!("{} is not on a drive letter", dest.display())),
+        },
+        _ => Err(format!("{} is not on a drive letter", dest.display())),
+    }
+}
+
+/// `\Device\Harddisk1\DR81 (\Device\HarddiskVolume92)` for the disk behind a
+/// drive letter. Windows gives the disk a new `DR` number each time it
+/// disconnects and reconnects, so a changed name means the disk dropped.
+fn device_identity_for_letter(letter: char) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        let volume_device = query_dos_device(&format!("{letter}:"))?;
+        let disk_number = volume_disk_number(letter)?;
+        let disk_device = query_dos_device(&format!("PhysicalDrive{disk_number}"))?;
+        Ok(format!("{disk_device} ({volume_device})"))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = letter;
+        Err("device identity requires Windows".to_string())
+    }
+}
+
+#[cfg(windows)]
+fn query_dos_device(name: &str) -> Result<String, String> {
+    use windows::Win32::Storage::FileSystem::QueryDosDeviceW;
+    use windows::core::HSTRING;
+
+    let mut buffer = [0u16; 512];
+    let written = unsafe { QueryDosDeviceW(&HSTRING::from(name), Some(&mut buffer)) };
+    if written == 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(format!("{name}: {}", describe_os_error(&err)));
+    }
+    let end = buffer
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(written as usize);
+    Ok(String::from_utf16_lossy(&buffer[..end]))
+}
+
+#[cfg(windows)]
+fn volume_disk_number(letter: char) -> Result<u32, String> {
+    use std::fs::OpenOptions;
+    use std::mem::size_of_val;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+    use windows::Win32::System::IO::DeviceIoControl;
+    use windows::Win32::System::Ioctl::{IOCTL_STORAGE_GET_DEVICE_NUMBER, STORAGE_DEVICE_NUMBER};
+
+    let path = format!(r"\\.\{letter}:");
+    // Access 0 is enough to ask which disk the volume is on, and needs no elevation.
+    let volume = OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
+        .open(&path)
+        .map_err(|err| format!("open {path}: {}", describe_os_error(&err)))?;
+    let mut number = STORAGE_DEVICE_NUMBER::default();
+    let mut returned = 0u32;
+    unsafe {
+        DeviceIoControl(
+            HANDLE(volume.as_raw_handle()),
+            IOCTL_STORAGE_GET_DEVICE_NUMBER,
+            None,
+            0,
+            Some(&mut number as *mut _ as *mut _),
+            size_of_val(&number) as u32,
+            Some(&mut returned),
+            None,
+        )
+    }
+    .map_err(|err| format!("disk number for {path}: {err}"))?;
+    Ok(number.DeviceNumber)
+}
+
+/// Flush every file, directory and allocation table Windows has cached for the
+/// volume. Needs elevation, which the app already has.
+fn flush_volume(letter: char) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let path = format!(r"\\.\{letter}:");
+        let volume = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
+            .open(&path)
+            .map_err(|err| format!("open {path}: {}", describe_os_error(&err)))?;
+        volume
+            .sync_all()
+            .map_err(|err| format!("{path}: {}", describe_os_error(&err)))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = letter;
+        Err("volume flush requires Windows".to_string())
+    }
+}
+
+/// Run-log line naming which built-in FAT32 format path produced the volume.
+fn fat32_path_note(volume_path_error: Option<&str>) -> String {
+    match volume_path_error {
+        None => "FAT32 format path: locked volume (Ridgecrop method)".to_string(),
+        Some(err) => format!(
+            "FAT32 format path: physical disk fallback; locked volume path failed: {}",
+            err.lines().next().unwrap_or("").trim()
+        ),
     }
 }
 
@@ -301,7 +439,7 @@ fn format_large_fat32_volume(
     disk_number: u32,
     letter: char,
     label: &str,
-) -> Result<(), String> {
+) -> Result<String, String> {
     #[cfg(windows)]
     {
         format_large_fat32_volume_windows(disk_number, letter, label)
@@ -390,10 +528,10 @@ fn open_device_rw(path: &str, trace: &mut Fat32Trace) -> Result<std::fs::File, S
     open_device_rw_ex(path, false, false, trace)
 }
 
-/// Ridgecrop fat32format open: exclusive (`CreateFile` share mode 0) on `\\.\X:`.
+/// Ridgecrop fat32format open: exclusive share + FILE_FLAG_NO_BUFFERING on `\\.\X:`.
 #[cfg(windows)]
 fn open_volume_ridgecrop(path: &str, trace: &mut Fat32Trace) -> Result<std::fs::File, String> {
-    open_device_rw_ex(path, false, true, trace)
+    open_device_rw_flags(path, false, true, false, true, trace)
 }
 
 #[cfg(windows)]
@@ -403,16 +541,13 @@ fn open_device_rw_ex(
     exclusive: bool,
     trace: &mut Fat32Trace,
 ) -> Result<std::fs::File, String> {
-    open_device_rw_flags(path, share_write_first, exclusive, false, trace)
+    open_device_rw_flags(path, share_write_first, exclusive, false, false, trace)
 }
 
-/// PhysicalDrive format open: shared write WITHOUT FILE_FLAG_WRITE_THROUGH.
-/// On cheap USB flash controllers, WRITE_THROUGH sets SCSI FUA=1 on every
-/// 64 KiB burst and makes the stick reset mid-format (`os error 55`); we call
-/// `sync_all()` once at the end instead.
+/// PhysicalDrive fallback open: shared write, buffered (no WRITE_THROUGH).
 #[cfg(windows)]
 fn open_physical_for_format(path: &str, trace: &mut Fat32Trace) -> Result<std::fs::File, String> {
-    open_device_rw_flags(path, true, false, false, trace)
+    open_device_rw_flags(path, true, false, false, false, trace)
 }
 
 #[cfg(windows)]
@@ -421,12 +556,13 @@ fn open_device_rw_flags(
     share_write_first: bool,
     exclusive: bool,
     write_through: bool,
+    no_buffering: bool,
     trace: &mut Fat32Trace,
 ) -> Result<std::fs::File, String> {
     use std::fs::OpenOptions;
     use std::os::windows::fs::OpenOptionsExt;
     use windows::Win32::Storage::FileSystem::{
-        FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_FLAG_NO_BUFFERING, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
     let sleep_ms = DRIVE_ACCESS_TIMEOUT_MS / u64::from(DRIVE_ACCESS_RETRIES);
@@ -443,8 +579,15 @@ fn open_device_rw_flags(
         };
         let mut opts = OpenOptions::new();
         opts.read(true).write(true).share_mode(share);
+        let mut flags = 0u32;
         if write_through {
-            opts.custom_flags(FILE_FLAG_WRITE_THROUGH.0);
+            flags |= FILE_FLAG_WRITE_THROUGH.0;
+        }
+        if no_buffering {
+            flags |= FILE_FLAG_NO_BUFFERING.0;
+        }
+        if flags != 0 {
+            opts.custom_flags(flags);
         }
         match opts.open(path) {
             Ok(file) => {
@@ -455,10 +598,16 @@ fn open_device_rw_flags(
                 } else {
                     "read"
                 };
-                let thru = if write_through { "+writethrough" } else { "" };
+                let mut extras = String::new();
+                if write_through {
+                    extras.push_str("+writethrough");
+                }
+                if no_buffering {
+                    extras.push_str("+nobuffering");
+                }
                 trace.ok(
                     &format!("open {path}"),
-                    format!("share={share_label}{thru} attempts={attempts}"),
+                    format!("share={share_label}{extras} attempts={attempts}"),
                 );
                 return Ok(file);
             }
@@ -1558,16 +1707,35 @@ fn format_large_fat32_volume_windows(
     disk_number: u32,
     letter: char,
     label: &str,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let mut trace = Fat32Trace::new();
     trace.note(format!(
         "begin disk={disk_number} letter={letter} label={label:?}"
     ));
 
-    // Letter is not assigned yet (caller wiped/created only). Write via
-    // PhysicalDrive, then assign once — never mount RAW.
+    // Primary path: Ridgecrop fat32format.c — exclusive `\\.\X:` + NO_BUFFERING
+    // + lock, then write. Caller already assigned the letter.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    trace.section("ridgecrop volume (exclusive lock, NO_BUFFERING)");
+    let fallback_note = match format_via_ridgecrop(letter, label, &mut trace) {
+        Ok(()) => {
+            if let Err(err) = clear_fat32_nt_dirty_bit(letter, &mut trace) {
+                trace.note(format!("clear dirty ignored: {err}"));
+            }
+            trace.ok("ridgecrop volume", "success");
+            return Ok(fat32_path_note(None));
+        }
+        Err(err) => {
+            trace.fail("ridgecrop volume", &err);
+            trace.note("falling back to PhysicalDrive format");
+            fat32_path_note(Some(&err))
+        }
+    };
+
+    // Fallback: PhysicalDrive write (no letter lock). Used only if the volume
+    // path cannot be locked — keep the letter already assigned.
     let physical_path = format!(r"\\.\PhysicalDrive{disk_number}");
-    trace.section("physical format (no letter yet)");
+    trace.section("physical format fallback");
     let physical = match open_physical_for_format(&physical_path, &mut trace) {
         Ok(file) => file,
         Err(err) => {
@@ -1596,72 +1764,31 @@ fn format_large_fat32_volume_windows(
         &mut trace,
     ) {
         trace.fail("physical format", &err);
-        // Pause briefly so USBSTOR can settle/re-enumerate after a 55/433 reset.
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-        // One reopen retry before giving up — no volume-letter paths (no letter).
-        trace.section("physical format reopen");
-        match open_physical_for_format(&physical_path, &mut trace).and_then(|file| {
-            format_fat32_on_partition_view(
-                file,
-                &physical_path,
-                offset,
-                length,
-                label,
-                &mut trace,
-            )
-        }) {
-            Ok(()) => trace.ok("physical format reopen", "ok"),
-            Err(err) => {
-                trace.fail("physical format reopen", &err);
-                return Err(persist_fat32_trace_failure(disk_number, letter, label, &trace));
-            }
-        }
+        return Err(persist_fat32_trace_failure(disk_number, letter, label, &trace));
     }
 
-    // Close/reopen so verify cannot read our own dirty page cache. Mid-FAT
-    // zeros that never hit the flash are what later surface as os error 1392.
-    trace.section("durable read-back");
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    match verify_physical_fat32_durable(&physical_path, offset, length, &mut trace) {
-        Ok(()) => trace.ok("durable read-back", "ok"),
-        Err(err) => {
-            trace.fail("durable read-back", &err);
-            trace.section("physical format rewrite after cache miss");
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            if let Err(rewrite_err) = open_physical_for_format(&physical_path, &mut trace)
-                .and_then(|file| {
-                    format_fat32_on_partition_view(
-                        file,
-                        &physical_path,
-                        offset,
-                        length,
-                        label,
-                        &mut trace,
-                    )
-                })
-                .and_then(|_| {
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                    verify_physical_fat32_durable(&physical_path, offset, length, &mut trace)
-                })
-            {
-                trace.fail("physical format rewrite", &rewrite_err);
-                return Err(persist_fat32_trace_failure(disk_number, letter, label, &trace));
-            }
-            trace.ok("physical format rewrite", "ok");
-        }
-    }
-
-    // Let VDS settle before diskpart select/assign.
-    std::thread::sleep(std::time::Duration::from_millis(750));
-    trace.section("assign letter after format");
-    match assign_letter_after_format(disk_number, letter, label, &mut trace) {
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    match verify_fat32_mount(letter, &mut trace) {
         Ok(()) => {
-            trace.ok("assign after format", "success");
-            Ok(())
+            if let Err(err) = clear_fat32_nt_dirty_bit(letter, &mut trace) {
+                trace.note(format!("clear dirty ignored: {err}"));
+            }
+            trace.ok("physical format fallback", "success");
+            Ok(fallback_note)
         }
         Err(err) => {
-            trace.fail("assign after format", &err);
-            Err(persist_fat32_trace_failure(disk_number, letter, label, &trace))
+            // Letter may be stale after raw rewrite — try a quiet reassign.
+            trace.note(format!("verify after physical failed: {err}; reassign"));
+            match assign_letter_after_format(disk_number, letter, label, &mut trace) {
+                Ok(()) => {
+                    trace.ok("physical format fallback", "success after reassign");
+                    Ok(fallback_note)
+                }
+                Err(reassign_err) => {
+                    trace.fail("assign after physical fallback", &reassign_err);
+                    Err(persist_fat32_trace_failure(disk_number, letter, label, &trace))
+                }
+            }
         }
     }
 }
@@ -1994,12 +2121,63 @@ try {
 #[cfg(test)]
 mod tests {
     use super::{
-        describe_os_error, diskpart_script_error, diskpart_wipe_assign_succeeded,
-        diskpart_wipe_partition_succeeded, fat32_total_sectors, pad_fat_volume_label,
-        Fat32Trace, INVENTORY_SCRIPT,
+        describe_os_error, device_identity_for_letter, diskpart_script_error,
+        diskpart_wipe_assign_succeeded, diskpart_wipe_partition_succeeded, drive_letter_of,
+        fat32_path_note, fat32_total_sectors, pad_fat_volume_label, Fat32Trace, INVENTORY_SCRIPT,
     };
     use std::fs;
     use std::io;
+    use std::path::Path;
+
+    #[test]
+    fn drive_letter_of_reads_plain_and_extended_drive_paths() {
+        assert_eq!(drive_letter_of(Path::new(r"E:\")), Ok('E'));
+        assert_eq!(drive_letter_of(Path::new(r"\\?\f:\folder")), Ok('F'));
+    }
+
+    #[test]
+    fn drive_letter_of_rejects_paths_without_a_drive_letter() {
+        assert_eq!(
+            drive_letter_of(Path::new(r"\\server\share\folder")),
+            Err(r"\\server\share\folder is not on a drive letter".to_string())
+        );
+    }
+
+    #[test]
+    fn device_identity_names_the_disk_and_volume_devices_and_is_repeatable() {
+        let system = std::env::var("SystemDrive").expect("SystemDrive");
+        let letter = system.chars().next().expect("drive letter");
+
+        let first = device_identity_for_letter(letter).expect("system drive identity");
+        let second = device_identity_for_letter(letter).expect("system drive identity");
+
+        assert!(first.starts_with(r"\Device\Harddisk"), "{first}");
+        assert!(first.contains(r"\Device\HarddiskVolume"), "{first}");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn device_identity_fails_for_an_unused_drive_letter() {
+        let unused = super::free_drive_letter().expect("a free drive letter");
+        let err = device_identity_for_letter(unused).expect_err("unused letter has no device");
+        assert!(err.starts_with(&format!("{unused}:")), "{err}");
+    }
+
+    #[test]
+    fn fat32_path_note_names_the_locked_volume_path() {
+        assert_eq!(
+            fat32_path_note(None),
+            "FAT32 format path: locked volume (Ridgecrop method)"
+        );
+    }
+
+    #[test]
+    fn fat32_path_note_names_the_fallback_with_the_first_line_of_the_reason() {
+        assert_eq!(
+            fat32_path_note(Some("lock \\\\.\\E: failed (os error 5)\nmore detail")),
+            "FAT32 format path: physical disk fallback; locked volume path failed: lock \\\\.\\E: failed (os error 5)"
+        );
+    }
 
     #[test]
     fn diskpart_success_ignores_already_online_vds_noise() {

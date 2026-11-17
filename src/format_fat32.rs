@@ -10,6 +10,66 @@ const BYTES_PER_SECTOR: u32 = 512;
 const NUM_FATS: u32 = 2;
 const BACKUP_BOOT_SECTOR: u32 = 6;
 const BURST_SECTORS: u32 = 128; // 64 KiB
+/// Page alignment satisfies FILE_FLAG_NO_BUFFERING physical-sector rules.
+const BUFFER_ALIGN: usize = 4096;
+
+/// Page-aligned buffer for `FILE_FLAG_NO_BUFFERING` volume I/O (Ridgecrop).
+struct AlignedBuf {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl AlignedBuf {
+    fn zeros(len: usize) -> io::Result<Self> {
+        let mut buf = Self::alloc(len)?;
+        buf.as_mut_slice().fill(0);
+        Ok(buf)
+    }
+
+    fn from_slice(data: &[u8]) -> io::Result<Self> {
+        let mut buf = Self::alloc(data.len())?;
+        buf.as_mut_slice().copy_from_slice(data);
+        Ok(buf)
+    }
+
+    fn alloc(len: usize) -> io::Result<Self> {
+        let size = len.max(1);
+        let layout = std::alloc::Layout::from_size_align(size, BUFFER_ALIGN)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "aligned alloc failed",
+            ));
+        }
+        debug_assert_eq!((ptr as usize) % BUFFER_ALIGN, 0);
+        Ok(Self { ptr, len })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        if self.len == 0 {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        if self.len == 0 {
+            return &mut [];
+        }
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        let size = self.len.max(1);
+        if let Ok(layout) = std::alloc::Layout::from_size_align(size, BUFFER_ALIGN) {
+            unsafe { std::alloc::dealloc(self.ptr, layout) };
+        }
+    }
+}
 
 /// Format a partition image as FAT32.
 ///
@@ -224,9 +284,12 @@ fn read_sectors<R: Read + Seek>(
     buf: &mut [u8],
 ) -> io::Result<()> {
     assert_eq!(buf.len() % BYTES_PER_SECTOR as usize, 0);
+    let mut aligned = AlignedBuf::zeros(buf.len())?;
     let offset = u64::from(start_sector) * u64::from(BYTES_PER_SECTOR);
     device.seek(SeekFrom::Start(offset))?;
-    device.read_exact(buf)
+    device.read_exact(aligned.as_mut_slice())?;
+    buf.copy_from_slice(aligned.as_slice());
+    Ok(())
 }
 
 fn default_cluster_size(total_bytes: u64) -> u32 {
@@ -335,12 +398,14 @@ fn as_u32_slice_mut(buf: &mut [u8]) -> &mut [u32] {
 
 fn write_sectors<W: Write + Seek>(device: &mut W, start_sector: u32, data: &[u8]) -> io::Result<()> {
     assert_eq!(data.len() % BYTES_PER_SECTOR as usize, 0);
+    // Always copy into a page-aligned buffer — required for FILE_FLAG_NO_BUFFERING.
+    let aligned = AlignedBuf::from_slice(data)?;
     let offset = u64::from(start_sector) * u64::from(BYTES_PER_SECTOR);
     let mut last_err = None;
     for attempt in 0..5u32 {
         match device
             .seek(SeekFrom::Start(offset))
-            .and_then(|_| device.write_all(data))
+            .and_then(|_| device.write_all(aligned.as_slice()))
         {
             Ok(()) => return Ok(()),
             Err(err) => {
@@ -370,15 +435,14 @@ fn zero_sectors<W: Write + Seek>(
 ) -> io::Result<()> {
     let mut remaining = sector_count;
     let mut at = start_sector;
-    let burst = vec![0u8; (BURST_SECTORS * BYTES_PER_SECTOR) as usize];
+    let burst_len = (BURST_SECTORS * BYTES_PER_SECTOR) as usize;
+    let burst = AlignedBuf::zeros(burst_len)?;
     let total_bytes = u64::from(sector_count) * u64::from(BYTES_PER_SECTOR);
-    // Flush every ~1 MiB so USB write caches cannot silently drop early FAT zeros.
-    const FLUSH_EVERY_SECTORS: u32 = 2048;
-    let mut since_flush = 0u32;
     while remaining > 0 {
         let n = remaining.min(BURST_SECTORS);
         let bytes = (n * BYTES_PER_SECTOR) as usize;
-        if let Err(err) = write_sectors(device, at, &burst[..bytes]) {
+        // write_sectors re-copies into an aligned buf; pass the prefix length via slice.
+        if let Err(err) = write_sectors(device, at, &burst.as_slice()[..bytes]) {
             let done = u64::from(at.saturating_sub(start_sector)) * u64::from(BYTES_PER_SECTOR);
             return Err(io::Error::new(
                 err.kind(),
@@ -389,11 +453,6 @@ fn zero_sectors<W: Write + Seek>(
         }
         at += n;
         remaining -= n;
-        since_flush += n;
-        if since_flush >= FLUSH_EVERY_SECTORS {
-            device.flush()?;
-            since_flush = 0;
-        }
     }
     Ok(())
 }
