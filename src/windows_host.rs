@@ -403,9 +403,31 @@ fn open_device_rw_ex(
     exclusive: bool,
     trace: &mut Fat32Trace,
 ) -> Result<std::fs::File, String> {
+    open_device_rw_flags(path, share_write_first, exclusive, false, trace)
+}
+
+/// PhysicalDrive format open: shared write WITHOUT FILE_FLAG_WRITE_THROUGH.
+/// On cheap USB flash controllers, WRITE_THROUGH sets SCSI FUA=1 on every
+/// 64 KiB burst and makes the stick reset mid-format (`os error 55`); we call
+/// `sync_all()` once at the end instead.
+#[cfg(windows)]
+fn open_physical_for_format(path: &str, trace: &mut Fat32Trace) -> Result<std::fs::File, String> {
+    open_device_rw_flags(path, true, false, false, trace)
+}
+
+#[cfg(windows)]
+fn open_device_rw_flags(
+    path: &str,
+    share_write_first: bool,
+    exclusive: bool,
+    write_through: bool,
+    trace: &mut Fat32Trace,
+) -> Result<std::fs::File, String> {
     use std::fs::OpenOptions;
     use std::os::windows::fs::OpenOptionsExt;
-    use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+    use windows::Win32::Storage::FileSystem::{
+        FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
 
     let sleep_ms = DRIVE_ACCESS_TIMEOUT_MS / u64::from(DRIVE_ACCESS_RETRIES);
     let mut share_write = share_write_first;
@@ -419,12 +441,12 @@ fn open_device_rw_ex(
         } else {
             FILE_SHARE_READ.0 | if share_write { FILE_SHARE_WRITE.0 } else { 0 }
         };
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .share_mode(share)
-            .open(path)
-        {
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).share_mode(share);
+        if write_through {
+            opts.custom_flags(FILE_FLAG_WRITE_THROUGH.0);
+        }
+        match opts.open(path) {
             Ok(file) => {
                 let share_label = if exclusive {
                     "exclusive"
@@ -433,9 +455,10 @@ fn open_device_rw_ex(
                 } else {
                     "read"
                 };
+                let thru = if write_through { "+writethrough" } else { "" };
                 trace.ok(
                     &format!("open {path}"),
-                    format!("share={share_label} attempts={attempts}"),
+                    format!("share={share_label}{thru} attempts={attempts}"),
                 );
                 return Ok(file);
             }
@@ -965,7 +988,33 @@ fn format_fat32_on_partition_view(
         return Err(message);
     }
     trace.ok(&format!("flush {path}"), "ok");
+    // Drop the handle before the caller reopens for durable verify.
+    drop(physical);
     Ok(())
+}
+
+/// Re-open PhysicalDrive and verify FAT body samples outside our write cache.
+#[cfg(windows)]
+fn verify_physical_fat32_durable(
+    path: &str,
+    offset: u64,
+    length: u64,
+    trace: &mut Fat32Trace,
+) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom};
+
+    let physical = open_physical_for_format(path, trace)?;
+    let mut view = crate::sector_io::PartitionView::new(physical, offset, length);
+    let _ = length; // partition view length already applied
+    // Discard any seek state; verify reads from sector 0.
+    let _ = view.seek(SeekFrom::Start(0));
+    match crate::format_fat32::verify_fat32_image_auto(&mut view) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let message = format!("durable verify {path} offset {offset}: {}", describe_os_error(&err));
+            Err(message)
+        }
+    }
 }
 
 /// Assign a drive letter once after the FAT32 image is on disk. Do not
@@ -977,37 +1026,139 @@ fn assign_letter_after_format(
     label: &str,
     trace: &mut Fat32Trace,
 ) -> Result<(), String> {
-    use windows::core::HSTRING;
-    use windows::Win32::Storage::FileSystem::SetVolumeLabelW;
-
-    let root = format!(r"{letter}:\");
+    let _ = label; // already written into the BPB during PhysicalDrive format
+    // After PhysicalDrive write + IOCTL_DISK_UPDATE_PROPERTIES the disk can
+    // briefly drop out of VDS ("There is no disk selected"). Rescan/online and
+    // re-select before assign; run_diskpart_reassign retries the whole script.
     let script = format!(
-        "select disk {disk_number}\r\nselect partition 1\r\nassign letter={letter}\r\nexit\r\n"
+        "rescan\r\n\
+select disk {disk_number}\r\n\
+online disk noerr\r\n\
+attributes disk clear readonly noerr\r\n\
+select disk {disk_number}\r\n\
+select partition 1\r\n\
+assign letter={letter}\r\n\
+exit\r\n"
     );
     run_diskpart_reassign(&script, trace)?;
     trace.ok("diskpart assign", format!("letter={letter}"));
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(std::time::Duration::from_millis(800));
 
     let mut last_err = String::new();
     for attempt in 1..=10u32 {
         match verify_fat32_mount(letter, trace) {
             Ok(()) => {
-                let root_h = HSTRING::from(root.as_str());
-                let label_h = HSTRING::from(label);
-                match unsafe { SetVolumeLabelW(&root_h, &label_h) } {
-                    Ok(()) => trace.ok("SetVolumeLabel", format!("{root} -> {label:?}")),
-                    Err(err) => trace.note(format!("SetVolumeLabel ignored: {err}")),
+                // Do not SetVolumeLabelW or create probe files here: both set
+                // BS_Reserved1, and Explorer then offers Scan and Fix which
+                // steals the volume (os 433) before copy. Image was already
+                // read-back verified on PhysicalDrive; BPB carries the label.
+                if let Err(err) = clear_fat32_nt_dirty_bit(letter, trace) {
+                    trace.note(format!("clear dirty ignored: {err}"));
                 }
-                return Ok(());
+                match std::fs::read_dir(format!(r"{letter}:\")) {
+                    Ok(_) => {
+                        trace.ok("root listing", format!("{letter}:\\ ok"));
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        last_err = format!("root listing {letter}:\\: {err}");
+                        trace.note(format!("root listing attempt {attempt}: {last_err}"));
+                    }
+                }
             }
             Err(err) => {
                 last_err = err;
                 trace.note(format!("verify mount attempt {attempt}: {last_err}"));
-                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+    Err(last_err)
+}
+
+/// Clear Windows NT dirty flag (boot sector byte 65 / BS_Reserved1) and the
+/// Win9x ClnShut bit in FAT[1]. USBDLM documents byte 65=1 as the trigger for
+/// the "There's a problem with this drive. Scan and fix it" dialog.
+#[cfg(windows)]
+fn clear_fat32_nt_dirty_bit(letter: char, trace: &mut Fat32Trace) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::IO::DeviceIoControl;
+    use windows::Win32::System::Ioctl::{FSCTL_LOCK_VOLUME, FSCTL_UNLOCK_VOLUME};
+
+    let path = format!(r"\\.\{letter}:");
+    let mut volume = open_device_rw_ex(&path, true, false, trace)?;
+    let mut boot = [0u8; 512];
+    volume
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| volume.read_exact(&mut boot))
+        .map_err(|err| format!("read boot for dirty clear: {err}"))?;
+    if boot[510] != 0x55 || boot[511] != 0xAA {
+        return Err("boot signature missing while clearing dirty bit".into());
+    }
+    let reserved = u16::from_le_bytes([boot[14], boot[15]]) as u64;
+    let fat_size = u32::from_le_bytes([boot[36], boot[37], boot[38], boot[39]]) as u64;
+    let backup = u16::from_le_bytes([boot[50], boot[51]]) as u64;
+
+    let fat0_off = reserved * 512;
+    let mut fat_head = [0u8; 512];
+    let fat_ok = volume
+        .seek(SeekFrom::Start(fat0_off))
+        .and_then(|_| volume.read_exact(&mut fat_head))
+        .is_ok();
+    let fat1_dirty = fat_ok
+        && (u32::from_le_bytes([fat_head[4], fat_head[5], fat_head[6], fat_head[7]])
+            & 0x0C00_0000)
+            != 0x0C00_0000;
+    if boot[65] == 0 && !fat1_dirty {
+        trace.ok("dirty check", format!("{path} already clean"));
+        return Ok(());
+    }
+
+    let handle = HANDLE(volume.as_raw_handle());
+    let _ = unsafe { DeviceIoControl(handle, FSCTL_LOCK_VOLUME, None, 0, None, 0, None, None) };
+
+    if boot[65] != 0 {
+        boot[65] = 0; // BS_Reserved1 / CurrentHead — NT dirty flag
+        volume
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| volume.write_all(&boot))
+            .map_err(|err| format!("write boot dirty clear: {err}"))?;
+        if backup > 0 {
+            let backup_off = backup * 512;
+            let mut backup_boot = [0u8; 512];
+            if volume
+                .seek(SeekFrom::Start(backup_off))
+                .and_then(|_| volume.read_exact(&mut backup_boot))
+                .is_ok()
+            {
+                backup_boot[65] = 0;
+                let _ = volume
+                    .seek(SeekFrom::Start(backup_off))
+                    .and_then(|_| volume.write_all(&backup_boot));
             }
         }
     }
-    Err(last_err)
+
+    // Ensure FAT[1] ClnShutBit (0x08000000) is set — volume clean.
+    if fat1_dirty {
+        let mut e1 = u32::from_le_bytes([fat_head[4], fat_head[5], fat_head[6], fat_head[7]]);
+        e1 |= 0x0C00_0000; // ClnShut + HrdErr bits set (clean, no I/O errors)
+        fat_head[4..8].copy_from_slice(&e1.to_le_bytes());
+        let _ = volume
+            .seek(SeekFrom::Start(fat0_off))
+            .and_then(|_| volume.write_all(&fat_head));
+        let fat1_off = (reserved + fat_size) * 512;
+        let _ = volume
+            .seek(SeekFrom::Start(fat1_off))
+            .and_then(|_| volume.write_all(&fat_head));
+    }
+
+    let _ = volume.flush();
+    let _ = unsafe { DeviceIoControl(handle, FSCTL_UNLOCK_VOLUME, None, 0, None, 0, None, None) };
+    trace.ok("clear dirty", format!("{path} BS_Reserved1=0"));
+    Ok(())
 }
 
 /// Kept for volume-path fallbacks that already have a letter (lock/dismount only).
@@ -1025,14 +1176,48 @@ fn remount_fat32_letter(
 fn run_diskpart_reassign(script: &str, trace: &mut Fat32Trace) -> Result<(), String> {
     let path = temp_file("diskpart-reassign", "txt");
     std::fs::write(&path, script).map_err(|err| err.to_string())?;
-    let _ = ensure_virtual_disk_service();
-    let result = run_diskpart_once(&path);
-    let _ = std::fs::remove_file(&path);
-    match &result {
-        Ok(()) => {}
-        Err(err) => trace.fail("diskpart reassign", err),
+    let mut last_err = "diskpart reassign failed".to_string();
+    for attempt in 0..DISKPART_ATTEMPTS {
+        if let Err(err) = ensure_virtual_disk_service() {
+            trace.note(format!("vds ensure attempt {}: {err}", attempt + 1));
+        }
+        match run_diskpart_once(&path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&path);
+                if attempt > 0 {
+                    trace.ok(
+                        "diskpart reassign",
+                        format!("ok on attempt {}", attempt + 1),
+                    );
+                }
+                return Ok(());
+            }
+            Err(err) => {
+                let vds_down = diskpart_vds_startup_failure(&err);
+                last_err = err;
+                trace.note(format!(
+                    "diskpart reassign attempt {}: {last_err}",
+                    attempt + 1
+                ));
+                if vds_down {
+                    if let Err(restart_err) = restart_virtual_disk_service() {
+                        trace.note(format!("vds restart: {restart_err}"));
+                    }
+                }
+                if attempt + 1 < DISKPART_ATTEMPTS {
+                    let wait = if vds_down {
+                        DISKPART_WAIT.saturating_mul(2)
+                    } else {
+                        DISKPART_WAIT
+                    };
+                    std::thread::sleep(wait);
+                }
+            }
+        }
     }
-    result
+    let _ = std::fs::remove_file(&path);
+    trace.fail("diskpart reassign", &last_err);
+    Err(last_err)
 }
 
 #[cfg(windows)]
@@ -1383,7 +1568,7 @@ fn format_large_fat32_volume_windows(
     // PhysicalDrive, then assign once — never mount RAW.
     let physical_path = format!(r"\\.\PhysicalDrive{disk_number}");
     trace.section("physical format (no letter yet)");
-    let physical = match open_device_rw_ex(&physical_path, true, false, &mut trace) {
+    let physical = match open_physical_for_format(&physical_path, &mut trace) {
         Ok(file) => file,
         Err(err) => {
             trace.fail("probe physical", &err);
@@ -1411,19 +1596,20 @@ fn format_large_fat32_volume_windows(
         &mut trace,
     ) {
         trace.fail("physical format", &err);
+        // Pause briefly so USBSTOR can settle/re-enumerate after a 55/433 reset.
+        std::thread::sleep(std::time::Duration::from_millis(1500));
         // One reopen retry before giving up — no volume-letter paths (no letter).
         trace.section("physical format reopen");
-        match open_device_rw_ex(&physical_path, true, false, &mut trace)
-            .and_then(|file| {
-                format_fat32_on_partition_view(
-                    file,
-                    &physical_path,
-                    offset,
-                    length,
-                    label,
-                    &mut trace,
-                )
-            }) {
+        match open_physical_for_format(&physical_path, &mut trace).and_then(|file| {
+            format_fat32_on_partition_view(
+                file,
+                &physical_path,
+                offset,
+                length,
+                label,
+                &mut trace,
+            )
+        }) {
             Ok(()) => trace.ok("physical format reopen", "ok"),
             Err(err) => {
                 trace.fail("physical format reopen", &err);
@@ -1432,6 +1618,41 @@ fn format_large_fat32_volume_windows(
         }
     }
 
+    // Close/reopen so verify cannot read our own dirty page cache. Mid-FAT
+    // zeros that never hit the flash are what later surface as os error 1392.
+    trace.section("durable read-back");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    match verify_physical_fat32_durable(&physical_path, offset, length, &mut trace) {
+        Ok(()) => trace.ok("durable read-back", "ok"),
+        Err(err) => {
+            trace.fail("durable read-back", &err);
+            trace.section("physical format rewrite after cache miss");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if let Err(rewrite_err) = open_physical_for_format(&physical_path, &mut trace)
+                .and_then(|file| {
+                    format_fat32_on_partition_view(
+                        file,
+                        &physical_path,
+                        offset,
+                        length,
+                        label,
+                        &mut trace,
+                    )
+                })
+                .and_then(|_| {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    verify_physical_fat32_durable(&physical_path, offset, length, &mut trace)
+                })
+            {
+                trace.fail("physical format rewrite", &rewrite_err);
+                return Err(persist_fat32_trace_failure(disk_number, letter, label, &trace));
+            }
+            trace.ok("physical format rewrite", "ok");
+        }
+    }
+
+    // Let VDS settle before diskpart select/assign.
+    std::thread::sleep(std::time::Duration::from_millis(750));
     trace.section("assign letter after format");
     match assign_letter_after_format(disk_number, letter, label, &mut trace) {
         Ok(()) => {

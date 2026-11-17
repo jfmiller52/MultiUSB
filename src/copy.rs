@@ -37,18 +37,65 @@ pub fn copy_tree(
         match entry.kind {
             EntryKind::Directory => {
                 let dest = dest_root.join(&entry.relative);
-                let _ = std::fs::create_dir_all(extended_path(&dest));
+                let dest_ext = extended_path(&dest);
+                let mut created = false;
+                let mut last_detail = String::new();
+                for attempt in 1..=policy.attempts {
+                    match std::fs::create_dir_all(&dest_ext) {
+                        Ok(()) => {
+                            created = true;
+                            break;
+                        }
+                        Err(err) => {
+                            let code = err.raw_os_error();
+                            last_detail = format!("create dir: {err}");
+                            if attempt < policy.attempts {
+                                let wait = if matches!(code, Some(1392 | 433 | 55 | 21 | 31)) {
+                                    policy.wait.saturating_mul(2)
+                                } else {
+                                    policy.wait
+                                };
+                                sleep(wait);
+                            }
+                        }
+                    }
+                }
+                if !created {
+                    return Err(CopyError::File {
+                        path: entry.relative.clone(),
+                        attempts: policy.attempts,
+                        detail: last_detail,
+                    });
+                }
             }
             EntryKind::File => {
                 let src = source_root.join(&entry.relative);
                 let dest = dest_root.join(&entry.relative);
-                if let Some(parent) = dest.parent() {
-                    let _ = std::fs::create_dir_all(extended_path(parent));
+                let src_ext = extended_path(&src);
+                let dest_ext = extended_path(&dest);
+                // Fail fast if the source itself is unreadable.
+                if let Err(err) = std::fs::metadata(&src_ext) {
+                    return Err(CopyError::File {
+                        path: entry.relative.clone(),
+                        attempts: 1,
+                        detail: format!("source: {err}"),
+                    });
                 }
                 let mut copied = false;
                 let mut last_detail = String::new();
                 for attempt in 1..=policy.attempts {
-                    match std::fs::copy(extended_path(&src), extended_path(&dest)) {
+                    // Parent creation is inside the retry loop: a file sitting where
+                    // the directory should be (test / race) must still retry like copy.
+                    if let Some(parent) = dest.parent() {
+                        if let Err(err) = std::fs::create_dir_all(extended_path(parent)) {
+                            last_detail = format!("create parent: {err}");
+                            if attempt < policy.attempts {
+                                sleep(policy.wait);
+                            }
+                            continue;
+                        }
+                    }
+                    match std::fs::copy(&src_ext, &dest_ext) {
                         Ok(bytes) => {
                             total += bytes;
                             on_bytes(bytes);
@@ -56,9 +103,17 @@ pub fn copy_tree(
                             break;
                         }
                         Err(err) => {
-                            last_detail = err.to_string();
+                            let code = err.raw_os_error();
+                            last_detail = format!("dest: {err}");
+                            // 1392 = ERROR_FILE_CORRUPT on a freshly formatted stick —
+                            // usually volume not settled; wait longer than the normal retry.
                             if attempt < policy.attempts {
-                                sleep(policy.wait);
+                                let wait = if matches!(code, Some(1392 | 433 | 55 | 21 | 31)) {
+                                    policy.wait.saturating_mul(2)
+                                } else {
+                                    policy.wait
+                                };
+                                sleep(wait);
                             }
                         }
                     }

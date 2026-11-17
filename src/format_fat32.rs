@@ -4,7 +4,7 @@
 //! `fatfs` crate's small writes were dying with Windows os error 433 on real
 //! USB sticks even after lock/dismount.
 
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
 const BYTES_PER_SECTOR: u32 = 512;
 const NUM_FATS: u32 = 2;
@@ -15,7 +15,7 @@ const BURST_SECTORS: u32 = 128; // 64 KiB
 ///
 /// `device` must accept seeks and writes at relative offset 0 = start of the
 /// partition (not the whole disk). All writes are multiples of 512 bytes.
-pub fn format_fat32_volume<W: Write + Seek>(
+pub fn format_fat32_volume<W: Read + Write + Seek>(
     device: &mut W,
     total_bytes: u64,
     hidden_sectors: u32,
@@ -50,9 +50,22 @@ pub fn format_fat32_volume<W: Write + Seek>(
     // fat32format.c). Do not inflate reserved for 1 MiB alignment — that layout
     // differed from the proven Windows-mountable writer.
     let reserved = 32u32;
-    let fat_size = fat_size_sectors(total_sectors, reserved, sectors_per_cluster, NUM_FATS);
+    let mut fat_size = fat_size_sectors(total_sectors, reserved, sectors_per_cluster, NUM_FATS);
+    // fat32format.c: grow the FAT if the closed formula undershoots cluster entries.
+    for _ in 0..4 {
+        let system_area = reserved + NUM_FATS * fat_size;
+        let user_area = total_sectors.checked_sub(system_area).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "system area too large")
+        })?;
+        let cluster_count = user_area / sectors_per_cluster;
+        let fat_needed =
+            (u64::from(cluster_count) * 4).div_ceil(u64::from(BYTES_PER_SECTOR)) as u32;
+        if fat_needed <= fat_size {
+            break;
+        }
+        fat_size = fat_needed;
+    }
     let system_area = reserved + NUM_FATS * fat_size;
-
     let user_area = total_sectors
         .checked_sub(system_area)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "system area too large"))?;
@@ -90,8 +103,12 @@ pub fn format_fat32_volume<W: Write + Seek>(
     }
 
     // Clear reserved + FATs + first data cluster (root).
+    // Cheap USB controllers often drop earlier cached writes when the buffer
+    // fills — if FAT-body zeros are lost but boot/FAT-head (written last) stick,
+    // Windows mounts "OK" then returns os error 1392 on real allocation.
     let clear_sectors = system_area + sectors_per_cluster;
     zero_sectors(device, 0, clear_sectors)?;
+    device.flush()?;
 
     write_sectors(device, 0, &boot)?;
     write_sectors(device, 1, &fsinfo)?;
@@ -102,7 +119,114 @@ pub fn format_fat32_volume<W: Write + Seek>(
         write_sectors(device, start, &first_fat)?;
     }
     device.flush()?;
+    verify_fat32_image(device, reserved, fat_size)?;
     Ok(())
+}
+
+/// Parse BPB then confirm boot / FSInfo / FAT survived on the media.
+pub fn verify_fat32_image_auto<R: Read + Seek>(device: &mut R) -> io::Result<()> {
+    let mut boot = [0u8; BYTES_PER_SECTOR as usize];
+    read_sectors(device, 0, &mut boot)?;
+    let reserved = u16::from_le_bytes([boot[14], boot[15]]) as u32;
+    let fat_size = u32::from_le_bytes([boot[36], boot[37], boot[38], boot[39]]);
+    if reserved == 0 || fat_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid BPB reserved={reserved} fat_size={fat_size}"),
+        ));
+    }
+    verify_fat32_image(device, reserved, fat_size)
+}
+
+/// Confirm boot / FSInfo / first FAT sector survived on the media.
+/// Catches USB stacks that accept WriteFile then discard the data.
+pub fn verify_fat32_image<R: Read + Seek>(
+    device: &mut R,
+    reserved: u32,
+    fat_size: u32,
+) -> io::Result<()> {
+    let mut boot = [0u8; BYTES_PER_SECTOR as usize];
+    read_sectors(device, 0, &mut boot)?;
+    if boot[510] != 0x55 || boot[511] != 0xAA {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "boot signature missing after format write",
+        ));
+    }
+    if &boot[82..90] != b"FAT32   " {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "boot FS type not FAT32 after format write",
+        ));
+    }
+    // BS_Reserved1 / CurrentHead — must be 0 or Windows pops Scan and Fix.
+    if boot[65] != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("boot dirty byte set after format (BS_Reserved1={})", boot[65]),
+        ));
+    }
+    let mut fsinfo = [0u8; BYTES_PER_SECTOR as usize];
+    read_sectors(device, 1, &mut fsinfo)?;
+    if fsinfo[0..4] != 0x4161_5252u32.to_le_bytes() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "FSInfo lead signature mismatch after format write",
+        ));
+    }
+    let mut fat0 = [0u8; BYTES_PER_SECTOR as usize];
+    read_sectors(device, reserved, &mut fat0)?;
+    let w0 = u32::from_le_bytes(fat0[0..4].try_into().unwrap());
+    let w1 = u32::from_le_bytes(fat0[4..8].try_into().unwrap());
+    let w2 = u32::from_le_bytes(fat0[8..12].try_into().unwrap());
+    if w0 != 0x0FFF_FFF8 || w1 != 0x0FFF_FFFF || w2 != 0x0FFF_FFFF {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("first FAT entries corrupt after format write ({w0:#x},{w1:#x},{w2:#x})"),
+        ));
+    }
+    // Mirror FAT must match the head sector we just wrote.
+    let mut fat1 = [0u8; BYTES_PER_SECTOR as usize];
+    read_sectors(device, reserved + fat_size, &mut fat1)?;
+    if fat1[..12] != fat0[..12] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "FAT mirror head mismatch after format write",
+        ));
+    }
+    // Sample mid-FAT and near-end sectors — these are the first bytes written
+    // during zeroing and the first to vanish from a lying write cache.
+    if fat_size > 2 {
+        for &rel in &[fat_size / 2, fat_size.saturating_sub(2)] {
+            let mut mid = [0u8; BYTES_PER_SECTOR as usize];
+            read_sectors(device, reserved + rel, &mut mid)?;
+            if mid.iter().any(|b| *b != 0) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("FAT body not zero at sector +{rel} after format write"),
+                ));
+            }
+            read_sectors(device, reserved + fat_size + rel, &mut mid)?;
+            if mid.iter().any(|b| *b != 0) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("FAT mirror body not zero at sector +{rel} after format write"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_sectors<R: Read + Seek>(
+    device: &mut R,
+    start_sector: u32,
+    buf: &mut [u8],
+) -> io::Result<()> {
+    assert_eq!(buf.len() % BYTES_PER_SECTOR as usize, 0);
+    let offset = u64::from(start_sector) * u64::from(BYTES_PER_SECTOR);
+    device.seek(SeekFrom::Start(offset))?;
+    device.read_exact(buf)
 }
 
 fn default_cluster_size(total_bytes: u64) -> u32 {
@@ -248,6 +372,9 @@ fn zero_sectors<W: Write + Seek>(
     let mut at = start_sector;
     let burst = vec![0u8; (BURST_SECTORS * BYTES_PER_SECTOR) as usize];
     let total_bytes = u64::from(sector_count) * u64::from(BYTES_PER_SECTOR);
+    // Flush every ~1 MiB so USB write caches cannot silently drop early FAT zeros.
+    const FLUSH_EVERY_SECTORS: u32 = 2048;
+    let mut since_flush = 0u32;
     while remaining > 0 {
         let n = remaining.min(BURST_SECTORS);
         let bytes = (n * BYTES_PER_SECTOR) as usize;
@@ -262,6 +389,11 @@ fn zero_sectors<W: Write + Seek>(
         }
         at += n;
         remaining -= n;
+        since_flush += n;
+        if since_flush >= FLUSH_EVERY_SECTORS {
+            device.flush()?;
+            since_flush = 0;
+        }
     }
     Ok(())
 }
@@ -298,5 +430,30 @@ mod tests {
             format_fat32_volume(&mut Cursor::new(&mut image[..]), 1024, 0, b"NO NAME    ")
                 .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn fat_size_grows_when_closed_formula_undershoots() {
+        // Synthetic numbers where FatNeeded > initial FatSize once.
+        let reserved = 32u32;
+        let spc = 64u32; // 32 KiB clusters
+        let total = 120_000_000u32; // ~58 GiB worth of sectors
+        let mut fat_size = fat_size_sectors(total, reserved, spc, NUM_FATS);
+        let initial = fat_size;
+        for _ in 0..4 {
+            let system_area = reserved + NUM_FATS * fat_size;
+            let user_area = total - system_area;
+            let cluster_count = user_area / spc;
+            let fat_needed =
+                (u64::from(cluster_count) * 4).div_ceil(u64::from(BYTES_PER_SECTOR)) as u32;
+            if fat_needed <= fat_size {
+                break;
+            }
+            fat_size = fat_needed;
+        }
+        let system_area = reserved + NUM_FATS * fat_size;
+        let clusters = (total - system_area) / spc;
+        let needed = (u64::from(clusters) * 4).div_ceil(u64::from(BYTES_PER_SECTOR)) as u32;
+        assert!(fat_size >= needed, "fat_size={fat_size} needed={needed} initial={initial}");
     }
 }
