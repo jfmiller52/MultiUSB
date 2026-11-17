@@ -1,8 +1,6 @@
 //! Built-in large FAT32 formatter.
 //!
-//! Writes only whole-sector, sequential bursts (no read-modify-write). The
-//! `fatfs` crate's small writes were dying with Windows os error 433 on real
-//! USB sticks even after lock/dismount.
+//! Writes only whole-sector, sequential bursts (no read-modify-write).
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
@@ -181,21 +179,6 @@ pub fn format_fat32_volume<W: Read + Write + Seek>(
     device.flush()?;
     verify_fat32_image(device, reserved, fat_size)?;
     Ok(())
-}
-
-/// Parse BPB then confirm boot / FSInfo / FAT survived on the media.
-pub fn verify_fat32_image_auto<R: Read + Seek>(device: &mut R) -> io::Result<()> {
-    let mut boot = [0u8; BYTES_PER_SECTOR as usize];
-    read_sectors(device, 0, &mut boot)?;
-    let reserved = u16::from_le_bytes([boot[14], boot[15]]) as u32;
-    let fat_size = u32::from_le_bytes([boot[36], boot[37], boot[38], boot[39]]);
-    if reserved == 0 || fat_size == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid BPB reserved={reserved} fat_size={fat_size}"),
-        ));
-    }
-    verify_fat32_image(device, reserved, fat_size)
 }
 
 /// Confirm boot / FSInfo / first FAT sector survived on the media.

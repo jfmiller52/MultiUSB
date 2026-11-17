@@ -423,18 +423,6 @@ fn pad_fat_volume_label(label: &str) -> [u8; 11] {
     out
 }
 
-fn fat32_total_sectors(length_bytes: i64) -> Result<u32, &'static str> {
-    const BYTES_PER_SECTOR: u64 = 512;
-    if length_bytes <= 0 {
-        return Err("non-positive size");
-    }
-    let total_sectors = (length_bytes as u64) / BYTES_PER_SECTOR;
-    if total_sectors == 0 || total_sectors > u64::from(u32::MAX) {
-        return Err("unsupported sector count");
-    }
-    Ok(total_sectors as u32)
-}
-
 fn format_large_fat32_volume(
     disk_number: u32,
     letter: char,
@@ -515,17 +503,6 @@ fn describe_os_error(err: &std::io::Error) -> String {
         Some(code) => format!("os error {code}: {err}"),
         None => err.to_string(),
     }
-}
-
-/// Open a volume or physical drive for write.
-///
-/// Mirrors Rufus `GetHandle`: by default prefer exclusive write (`FILE_SHARE_READ`
-/// only); after ~1/3 of the retry window, escalate to `FILE_SHARE_WRITE`.
-/// PhysicalDrive paths should start shared (`share_write_first`) because Windows
-/// already holds the mounted volume.
-#[cfg(windows)]
-fn open_device_rw(path: &str, trace: &mut Fat32Trace) -> Result<std::fs::File, String> {
-    open_device_rw_ex(path, false, false, trace)
 }
 
 /// Ridgecrop fat32format open: exclusive share + FILE_FLAG_NO_BUFFERING on `\\.\X:`.
@@ -640,34 +617,6 @@ fn open_device_rw_flags(
     let message = format!("open {path}: {detail} (attempts={attempts})");
     trace.fail(&format!("open {path}"), &detail);
     Err(message)
-}
-
-/// Drop Windows's volume handle. Do not call this before PhysicalDrive writes —
-/// on the PNY it caused os error 55 and removed the drive letter.
-#[cfg(windows)]
-#[allow(dead_code)]
-fn quiet_dismount_letter(letter: char, trace: &mut Fat32Trace) {
-    use std::os::windows::io::AsRawHandle;
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::IO::DeviceIoControl;
-    use windows::Win32::System::Ioctl::{
-        FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME, FSCTL_UNLOCK_VOLUME,
-    };
-
-    let volume_path = format!(r"\\.\{letter}:");
-    let Ok(volume) = open_device_rw_ex(&volume_path, true, false, trace) else {
-        trace.note(format!("quiet dismount {volume_path}: open failed, continuing"));
-        return;
-    };
-    let handle = HANDLE(volume.as_raw_handle());
-    let _ = unsafe { DeviceIoControl(handle, FSCTL_LOCK_VOLUME, None, 0, None, 0, None, None) };
-    match unsafe { DeviceIoControl(handle, FSCTL_DISMOUNT_VOLUME, None, 0, None, 0, None, None) } {
-        Ok(()) => trace.ok("quiet dismount", "ok"),
-        Err(err) => trace.note(format!("quiet dismount: ignored ({err})")),
-    }
-    let _ = unsafe { DeviceIoControl(handle, FSCTL_UNLOCK_VOLUME, None, 0, None, 0, None, None) };
-    drop(volume);
-    std::thread::sleep(std::time::Duration::from_millis(300));
 }
 
 #[cfg(windows)]
@@ -1027,44 +976,6 @@ fn format_via_ridgecrop(
 }
 
 #[cfg(windows)]
-fn volume_length_bytes(
-    volume: &std::fs::File,
-    path: &str,
-    trace: &mut Fat32Trace,
-) -> Result<i64, String> {
-    use std::mem::size_of_val;
-    use std::os::windows::io::AsRawHandle;
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::IO::DeviceIoControl;
-    use windows::Win32::System::Ioctl::{GET_LENGTH_INFORMATION, IOCTL_DISK_GET_LENGTH_INFO};
-
-    let handle = HANDLE(volume.as_raw_handle());
-    let mut length_info = GET_LENGTH_INFORMATION::default();
-    let mut returned = 0u32;
-    if let Err(err) = unsafe {
-        DeviceIoControl(
-            handle,
-            IOCTL_DISK_GET_LENGTH_INFO,
-            None,
-            0,
-            Some(&mut length_info as *mut _ as *mut _),
-            size_of_val(&length_info) as u32,
-            Some(&mut returned),
-            None,
-        )
-    } {
-        let message = format!("volume length {path}: {err}");
-        trace.fail("IOCTL_DISK_GET_LENGTH_INFO", &message);
-        return Err(message);
-    }
-    trace.ok(
-        "volume length",
-        format!("{path} length={}", length_info.Length),
-    );
-    Ok(length_info.Length)
-}
-
-#[cfg(windows)]
 fn format_fat32_on_file(
     file: &mut std::fs::File,
     path: &str,
@@ -1140,30 +1051,6 @@ fn format_fat32_on_partition_view(
     // Drop the handle before the caller reopens for durable verify.
     drop(physical);
     Ok(())
-}
-
-/// Re-open PhysicalDrive and verify FAT body samples outside our write cache.
-#[cfg(windows)]
-fn verify_physical_fat32_durable(
-    path: &str,
-    offset: u64,
-    length: u64,
-    trace: &mut Fat32Trace,
-) -> Result<(), String> {
-    use std::io::{Seek, SeekFrom};
-
-    let physical = open_physical_for_format(path, trace)?;
-    let mut view = crate::sector_io::PartitionView::new(physical, offset, length);
-    let _ = length; // partition view length already applied
-    // Discard any seek state; verify reads from sector 0.
-    let _ = view.seek(SeekFrom::Start(0));
-    match crate::format_fat32::verify_fat32_image_auto(&mut view) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let message = format!("durable verify {path} offset {offset}: {}", describe_os_error(&err));
-            Err(message)
-        }
-    }
 }
 
 /// Assign a drive letter once after the FAT32 image is on disk. Do not
@@ -1310,17 +1197,6 @@ fn clear_fat32_nt_dirty_bit(letter: char, trace: &mut Fat32Trace) -> Result<(), 
     Ok(())
 }
 
-/// Kept for volume-path fallbacks that already have a letter (lock/dismount only).
-#[cfg(windows)]
-fn remount_fat32_letter(
-    disk_number: u32,
-    letter: char,
-    label: &str,
-    trace: &mut Fat32Trace,
-) -> Result<(), String> {
-    assign_letter_after_format(disk_number, letter, label, trace)
-}
-
 #[cfg(windows)]
 fn run_diskpart_reassign(script: &str, trace: &mut Fat32Trace) -> Result<(), String> {
     let path = temp_file("diskpart-reassign", "txt");
@@ -1413,168 +1289,6 @@ fn verify_fat32_mount(letter: char, trace: &mut Fat32Trace) -> Result<(), String
     }
 }
 
-/// Write FAT32 through a locked volume handle. `dismount` matches Rufus when true;
-/// PNY traces showed os error 433 mid-fatfs after a successful dismount, so we also
-/// try lock-only first.
-#[cfg(windows)]
-fn format_via_locked_volume(
-    letter: char,
-    label: &str,
-    hidden_sectors: u32,
-    dismount: bool,
-    trace: &mut Fat32Trace,
-) -> Result<(), String> {
-    use std::os::windows::io::AsRawHandle;
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::IO::DeviceIoControl;
-    use windows::Win32::System::Ioctl::{FSCTL_DISMOUNT_VOLUME, FSCTL_UNLOCK_VOLUME};
-
-    let volume_path = format!(r"\\.\{letter}:");
-    let volume = open_device_rw(&volume_path, trace)?;
-    let volume_handle = HANDLE(volume.as_raw_handle());
-    let unlock = || unsafe {
-        let _ = DeviceIoControl(
-            volume_handle,
-            FSCTL_UNLOCK_VOLUME,
-            None,
-            0,
-            None,
-            0,
-            None,
-            None,
-        );
-    };
-
-    allow_extended_dasd_io(volume_handle, trace);
-    if let Err(err) = lock_volume_with_retries(volume_handle, &volume_path, trace) {
-        unlock();
-        return Err(err);
-    }
-    if dismount {
-        match unsafe {
-            DeviceIoControl(
-                volume_handle,
-                FSCTL_DISMOUNT_VOLUME,
-                None,
-                0,
-                None,
-                0,
-                None,
-                None,
-            )
-        } {
-            Ok(()) => trace.ok(&format!("dismount {volume_path}"), "ok"),
-            Err(err) => trace.note(format!("dismount {volume_path}: ignored fail ({err})")),
-        }
-    } else {
-        trace.note(format!("dismount {volume_path}: skipped"));
-    }
-
-    let length = match volume_length_bytes(&volume, &volume_path, trace) {
-        Ok(length) => length,
-        Err(err) => {
-            unlock();
-            return Err(err);
-        }
-    };
-    if length <= 0 {
-        unlock();
-        let message = format!("volume length {volume_path}: non-positive");
-        trace.fail("volume length", &message);
-        return Err(message);
-    }
-    trace.ok("volume bytes", format!("{length}"));
-
-    let mut volume = volume;
-    let result = format_fat32_on_file(
-        &mut volume,
-        &volume_path,
-        length as u64,
-        hidden_sectors,
-        label,
-        trace,
-    );
-    unlock();
-    drop(volume);
-    result
-}
-
-/// Write via PhysicalDrive only — no volume lock/dismount first.
-/// Quiet-dismount-before-write caused os error 55 on the PNY and dropped the letter.
-#[cfg(windows)]
-fn format_via_physical_only(
-    disk_number: u32,
-    letter: char,
-    offset: u64,
-    length: u64,
-    label: &str,
-    trace: &mut Fat32Trace,
-) -> Result<(), String> {
-    let physical_path = format!(r"\\.\PhysicalDrive{disk_number}");
-    trace.ok(
-        "using saved partition extent",
-        format!("offset={offset} length={length}"),
-    );
-    let physical = open_device_rw_ex(&physical_path, true, false, trace)?;
-    format_fat32_on_partition_view(physical, &physical_path, offset, length, label, trace)?;
-    remount_fat32_letter(disk_number, letter, label, trace)
-}
-
-/// Write via PhysicalDrive at a known partition extent while the letter is locked
-/// without dismounting.
-#[cfg(windows)]
-fn format_via_physical_while_volume_locked(
-    disk_number: u32,
-    letter: char,
-    label: &str,
-    offset: u64,
-    length: u64,
-    trace: &mut Fat32Trace,
-) -> Result<(), String> {
-    use std::os::windows::io::AsRawHandle;
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::IO::DeviceIoControl;
-    use windows::Win32::System::Ioctl::FSCTL_UNLOCK_VOLUME;
-
-    let physical_path = format!(r"\\.\PhysicalDrive{disk_number}");
-    let volume_path = format!(r"\\.\{letter}:");
-
-    trace.ok(
-        "using saved partition extent",
-        format!("offset={offset} length={length}"),
-    );
-    let physical = open_device_rw_ex(&physical_path, true, false, trace)?;
-
-    let volume = open_device_rw_ex(&volume_path, true, false, trace)?;
-    let volume_handle = HANDLE(volume.as_raw_handle());
-    let unlock = || unsafe {
-        let _ = DeviceIoControl(
-            volume_handle,
-            FSCTL_UNLOCK_VOLUME,
-            None,
-            0,
-            None,
-            0,
-            None,
-            None,
-        );
-    };
-
-    allow_extended_dasd_io(volume_handle, trace);
-    if let Err(err) = lock_volume_with_retries(volume_handle, &volume_path, trace) {
-        unlock();
-        return Err(err);
-    }
-    trace.note("dismount: skipped (physical path keeps volume mounted)");
-
-    let result =
-        format_fat32_on_partition_view(physical, &physical_path, offset, length, label, trace);
-    unlock();
-    drop(volume);
-    result?;
-    remount_fat32_letter(disk_number, letter, label, trace)
-}
-
 #[cfg(windows)]
 fn persist_fat32_trace_failure(
     disk_number: u32,
@@ -1599,107 +1313,6 @@ fn persist_fat32_trace_failure(
         }
     }
     message
-}
-
-#[cfg(windows)]
-#[allow(dead_code)]
-fn capture_command_output(
-    name: &str,
-    output: &std::process::Output,
-    trace: &mut Fat32Trace,
-) -> Result<(), String> {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stdout.trim().is_empty() {
-        trace.note(format!("{name} stdout: {}", stdout.trim()));
-    }
-    if !stderr.trim().is_empty() {
-        trace.note(format!("{name} stderr: {}", stderr.trim()));
-    }
-    if output.status.success() {
-        trace.ok(name, format!("exit {}", output.status));
-        Ok(())
-    } else {
-        let detail = if !stderr.trim().is_empty() {
-            stderr.trim().to_string()
-        } else if !stdout.trim().is_empty() {
-            stdout.trim().to_string()
-        } else {
-            format!("exit {}", output.status)
-        };
-        let message = format!("{name}: {detail}");
-        trace.fail(name, &detail);
-        Err(message)
-    }
-}
-
-/// Classic `format.com` — some Windows builds still allow >32 GiB FAT32 here
-/// even when `Format-Volume` returns StorageWMI "Size Not Supported".
-#[cfg(windows)]
-#[allow(dead_code)]
-fn format_via_format_com(
-    letter: char,
-    label: &str,
-    trace: &mut Fat32Trace,
-) -> Result<(), String> {
-    let mut args = vec![
-        format!("{letter}:"),
-        "/FS:FAT32".to_string(),
-        "/Q".to_string(),
-        "/Y".to_string(),
-    ];
-    if !label.is_empty() {
-        // format.com accepts /V:label; our labels are already restricted ASCII.
-        args.push(format!("/V:{label}"));
-    }
-    trace.note(format!("format.com args: {}", args.join(" ")));
-    let output = hidden_command("format.com")
-        .args(&args)
-        .output()
-        .map_err(|err| {
-            let message = format!("format.com spawn: {err}");
-            trace.fail("format.com", &message);
-            message
-        })?;
-    capture_command_output("format.com", &output, trace)
-}
-
-/// Windows Storage cmdlet — on this host it returned StorageWMI 4097
-/// "Size Not Supported" for ~58 GiB; kept as a secondary OS attempt.
-#[cfg(windows)]
-#[allow(dead_code)]
-fn format_via_format_volume(
-    letter: char,
-    label: &str,
-    trace: &mut Fat32Trace,
-) -> Result<(), String> {
-    let label_ps = label.replace('\'', "''");
-    let command = if label.is_empty() {
-        format!(
-            "Format-Volume -DriveLetter {letter} -FileSystem FAT32 -Confirm:$false -Force | Out-Null"
-        )
-    } else {
-        format!(
-            "Format-Volume -DriveLetter {letter} -FileSystem FAT32 -NewFileSystemLabel '{label_ps}' -Confirm:$false -Force | Out-Null"
-        )
-    };
-    trace.note(format!("Format-Volume command: {command}"));
-    let output = hidden_command("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &command,
-        ])
-        .output()
-        .map_err(|err| {
-            let message = format!("powershell Format-Volume spawn: {err}");
-            trace.fail("Format-Volume", &message);
-            message
-        })?;
-    capture_command_output("Format-Volume", &output, trace)
 }
 
 #[cfg(windows)]
@@ -2123,7 +1736,7 @@ mod tests {
     use super::{
         describe_os_error, device_identity_for_letter, diskpart_script_error,
         diskpart_wipe_assign_succeeded, diskpart_wipe_partition_succeeded, drive_letter_of,
-        fat32_path_note, fat32_total_sectors, pad_fat_volume_label, Fat32Trace, INVENTORY_SCRIPT,
+        fat32_path_note, pad_fat_volume_label, Fat32Trace, INVENTORY_SCRIPT,
     };
     use std::fs;
     use std::io;
@@ -2228,7 +1841,7 @@ Leaving DiskPart...
         let mut trace = Fat32Trace::new();
         trace.section("volume path");
         trace.fail(
-            r"fatfs format \\.\D:",
+            r"direct fat32 format \\.\D:",
             "ERROR_DEVICE_DOES_NOT_EXIST (433)",
         );
         trace.section("physical fallback");
@@ -2247,14 +1860,6 @@ Leaving DiskPart...
         assert!(describe_os_error(&err).contains("ERROR_DEVICE_DOES_NOT_EXIST (433)"));
         let err = io::Error::from_raw_os_error(87);
         assert!(describe_os_error(&err).contains("ERROR_INVALID_PARAMETER (87)"));
-    }
-
-    #[test]
-    fn fat32_total_sectors_from_volume_length() {
-        assert_eq!(fat32_total_sectors(64 * 1024 * 1024), Ok(131_072));
-        assert!(fat32_total_sectors(0).is_err());
-        assert!(fat32_total_sectors(-1).is_err());
-        assert!(fat32_total_sectors(400).is_err());
     }
 
     #[cfg(windows)]
